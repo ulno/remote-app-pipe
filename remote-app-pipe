@@ -1,0 +1,764 @@
+#!/usr/bin/env bash
+# Tildes below are intentionally kept literal and expanded against a remote $HOME.
+# shellcheck disable=SC2088
+set -euo pipefail
+
+# ---------------------------------------------------------
+# Defaults & State Variables
+# ---------------------------------------------------------
+TARGET_NEBULA_HOST=""
+SERVER_HOSTNAME=""
+APP=""
+APP_ARGS=()
+IS_SERVER=false
+INSTALL_DESKTOP=false
+DEPLOY_SELF=false
+# Keep the tilde literal: it is expanded against the remote $HOME, not the local one.
+REMOTE_BIN_DIR="~/.local/bin"
+
+# Icon handling: auto | always | never
+FETCH_ICON_MODE="auto"
+REFRESH_ICON_FILE=""
+
+# Desktop generator overrides
+DESKTOP_NAME=""
+DESKTOP_ICON=""
+DESKTOP_COMMENT=""
+DESKTOP_CATEGORIES="Network;"
+
+usage() {
+    cat <<EOF
+Usage:
+  remote-app-pipe -t <nebula_host> -H <server_hostname> <app> [app-args...]
+  remote-app-pipe --install-desktop -t <nebula_host> -H <server_hostname> -a <app> [options]
+  remote-app-pipe --refresh-icon <desktop-file>
+  remote-app-pipe --deploy -t <nebula_host> [--bin-dir <remote_path>]
+
+Modes:
+  Launch:
+    -t, --target <host>          Nebula host / SSH alias of the target machine (REQUIRED)
+    -H, --server-host <hostname> Physical hostname of the server (as in \`hostname\`) (REQUIRED)
+    <app>                        Application binary to run (thunderbird, zed, firefox, etc.)
+    --bin-dir <path>             Remote binary folder used to launch this script (default: ~/.local/bin)
+
+  Deployment:
+    --deploy                     Copy this script to target host's bin folder via scp
+    --bin-dir <path>             Remote binary folder (default: ~/.local/bin)
+
+  Desktop Entry Generator:
+    --install-desktop            Generate a KDE/XDG .desktop launcher and register it
+    -a, --app <app>              Application binary name (REQUIRED with --install-desktop)
+    -n, --name <name>            Display name for the launcher (default: "<App> (<Host>)")
+    -i, --icon <icon>            Desktop icon name or absolute path (default: "<app>")
+    -c, --comment <comment>      Description comment
+    --categories <cat>           Desktop categories (default: "Network;")
+
+  Icon handling:
+    --fetch-icon                 Always pull the app icon from the remote host
+    --no-fetch-icon              Never pull icons automatically
+    --refresh-icon <file>        Re-fetch the icon for an existing .desktop file
+                                 (target, host and app are read from its Exec= line)
+
+Examples:
+  # Deploy script to the university desktop:
+  remote-app-pipe --deploy -t uni-desktop-nebula
+
+  # Deploy script to home workstation with custom bin dir:
+  remote-app-pipe --deploy -t home-desktop-nebula --bin-dir /usr/local/bin
+
+  # Launch Thunderbird on the university desktop:
+  remote-app-pipe -t uni-desktop-nebula -H uni-desktop thunderbird
+
+  # Generate a desktop launcher for Thunderbird on Uni desktop:
+  remote-app-pipe --install-desktop -t uni-desktop-nebula -H uni-desktop -a thunderbird -n "Thunderbird (Uni)"
+
+  # Repair/refresh an existing launcher's icon:
+  remote-app-pipe --refresh-icon ~/.local/share/applications/remote-thunderbird-uni-desktop-nebula.desktop
+EOF
+    exit 1
+}
+
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+
+# Expand a leading ~ with a home directory that was determined remotely.
+expand_remote_path() {
+    local path="$1"
+    local home="$2"
+    case "$path" in
+        "~")
+            printf '%s\n' "$home"
+            ;;
+        "~/"*)
+            printf '%s/%s\n' "$home" "${path#\~/}"
+            ;;
+        *)
+            printf '%s\n' "$path"
+            ;;
+    esac
+}
+
+# Locate an icon in the local XDG icon theme / pixmap directories.
+# Prints the path and returns 0 when found, returns 1 otherwise.
+find_local_icon() {
+    local icon="$1"
+    local path
+    if [[ "$icon" == /* ]]; then
+        if [[ -f "$icon" ]]; then
+            printf '%s\n' "$icon"
+            return 0
+        fi
+        return 1
+    fi
+
+    local -a names=("$icon")
+    case "$icon" in
+        *.svg|*.png|*.xpm|*.ico) ;;
+        *) names+=("$icon.svg" "$icon.png" "$icon.xpm") ;;
+    esac
+
+    local dir name
+    for dir in \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/icons" \
+        "$HOME/.icons" \
+        "/usr/local/share/icons" \
+        "/usr/share/icons" \
+        "/usr/share/pixmaps"; do
+        [[ -d "$dir" ]] || continue
+        for name in "${names[@]}"; do
+            path=$(find "$dir" \( -type f -o -type l \) -name "$name" -print -quit 2>/dev/null || true)
+            if [[ -n "$path" ]]; then
+                printf '%s\n' "$path"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Ask the remote host which icon its .desktop entry uses and where that icon
+# actually lives. Prints "<icon-name><TAB><icon-path>" (path may be empty).
+remote_icon_lookup() {
+    local target="$1"
+    local app="$2"
+    local hint="${3:-}"
+
+    ssh "$target" sh -s -- "$app" "$hint" <<'REMOTE_SCRIPT'
+set -u
+
+app=$1
+hint=${2:-}
+
+desktop_dirs="$HOME/.local/share/applications $HOME/.local/share/flatpak/exports/share/applications /var/lib/flatpak/exports/share/applications /usr/local/share/applications /usr/share/applications"
+desktop=""
+
+# Prefer a desktop file whose basename matches the application name.
+for d in $desktop_dirs; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/$app.desktop" ]; then
+        desktop="$d/$app.desktop"
+        break
+    fi
+done
+
+# Otherwise match the first Exec=/TryExec= token against the app name.
+if [ -z "$desktop" ]; then
+    for d in $desktop_dirs; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*.desktop; do
+            [ -f "$f" ] || continue
+            if awk -v app="$app" '
+                /^Exec=/ || /^TryExec=/ {
+                    line = $0
+                    sub(/^[^=]*=/, "", line)
+                    n = split(line, parts, /[ \t]+/)
+                    for (i = 1; i <= n; i++) {
+                        t = parts[i]
+                        gsub(/^"|"$/, "", t)
+                        sub(/^.*\//, "", t)
+                        if (t == app) {
+                            found = 1
+                        }
+                    }
+                }
+                END { exit(found ? 0 : 1) }
+            ' "$f"; then
+                desktop="$f"
+                break 2
+            fi
+        done
+    done
+fi
+
+icon=""
+if [ -n "$desktop" ]; then
+    icon=$(sed -n 's/^Icon=//p' "$desktop" | head -n 1)
+fi
+[ -n "$icon" ] || icon="$hint"
+[ -n "$icon" ] || icon="$app"
+
+case "$icon" in
+    /*)
+        if [ -f "$icon" ]; then
+            printf '%s\t%s\n' "$icon" "$icon"
+            exit 0
+        fi
+        ;;
+esac
+
+# Prefer SVG, then PNG, then XPM. Within a directory, take the largest file so
+# that a 256x256 icon wins over a 16x16 one.
+for ext in svg png xpm; do
+    for d in \
+        "$HOME/.local/share/icons" \
+        "$HOME/.icons" \
+        "$HOME/.local/share/flatpak/exports/share/icons" \
+        "/var/lib/flatpak/exports/share/icons" \
+        "/usr/local/share/icons" \
+        "/usr/share/icons" \
+        "/usr/share/pixmaps" \
+        "/usr/local/share/pixmaps"; do
+        [ -d "$d" ] || continue
+        matches=$(find -L "$d" -type f -name "$icon.$ext" -printf '%s %p\n' 2>/dev/null || true)
+        if [ -n "$matches" ]; then
+            best=$(printf '%s\n' "$matches" | sort -nr | head -n 1 | cut -d' ' -f2-)
+            printf '%s\t%s\n' "$icon" "$best"
+            exit 0
+        fi
+    done
+done
+
+printf '%s\t\n' "$icon"
+REMOTE_SCRIPT
+}
+
+# Copy the remote app's icon into the local icon store and print its path.
+# Returns 1 if no icon could be found or copied.
+fetch_remote_icon() {
+    local target="$1"
+    local app="$2"
+    local hint="${3:-}"
+    local lookup icon_name icon_path
+
+    lookup="$(remote_icon_lookup "$target" "$app" "$hint")" || return 1
+    IFS=$'\t' read -r icon_name icon_path <<< "$lookup"
+
+    if [[ -z "$icon_path" ]]; then
+        echo "No icon file found on ${target} for app '${app}' (icon name: '${icon_name}')." >&2
+        return 1
+    fi
+
+    local icon_dir="${XDG_DATA_HOME:-$HOME/.local/share}/icons/remote-app-pipe"
+    mkdir -p "$icon_dir"
+
+    local safe_app="${app##*/}"
+    local icon_file
+    icon_file="$(basename "$icon_path")"
+    local dest="${icon_dir}/${safe_app}-${icon_file}"
+    if ! scp -q -- "${target}:${icon_path}" "$dest"; then
+        rm -f "$dest"
+        return 1
+    fi
+
+    printf '%s\n' "$dest"
+}
+
+# Minimal shell-like tokenizer for the Exec= value of a desktop entry. This
+# avoids eval() and copes with the double quotes that desktop files normally use.
+tokenize_exec() {
+    local s="$1"
+    local token=""
+    local quote=""
+    local c
+    local i
+
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        if [[ -n "$quote" ]]; then
+            if [[ "$c" == "$quote" ]]; then
+                quote=""
+            elif [[ "$c" == "\\" && "$quote" == '"' ]]; then
+                i=$((i + 1))
+                token+="${s:i:1}"
+            else
+                token+="$c"
+            fi
+        else
+            case "$c" in
+                "'"|'"')
+                    quote="$c"
+                    ;;
+                " "|$'\t')
+                    if [[ -n "$token" ]]; then
+                        printf '%s\n' "$token"
+                        token=""
+                    fi
+                    ;;
+                "\\")
+                    i=$((i + 1))
+                    token+="${s:i:1}"
+                    ;;
+                *)
+                    token+="$c"
+                    ;;
+            esac
+        fi
+    done
+
+    if [[ -n "$token" ]]; then
+        printf '%s\n' "$token"
+    fi
+}
+
+# Quote one argument for the Exec= key of a desktop entry.
+desktop_exec_arg() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//\`/\\\`}"
+    s="${s//\$/\\\$}"
+    printf '"%s"' "$s"
+}
+
+# Escape a value for a desktop entry Name=/Comment= key.
+desktop_field_value() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/}"
+    printf '%s' "$s"
+}
+
+update_desktop_icon() {
+    local file="$1"
+    local icon="$2"
+    local escaped
+
+    escaped=$(printf '%s' "$icon" | sed 's/[\\&|]/\\&/g')
+    if grep -q '^Icon=' "$file"; then
+        sed -i "s|^Icon=.*|Icon=${escaped}|" "$file"
+    else
+        sed -i "/^\[Desktop Entry\]/a Icon=${escaped}" "$file"
+    fi
+}
+
+refresh_desktop_database() {
+    local dir="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/applications}"
+    if command -v kbuildsycoca6 &>/dev/null; then
+        kbuildsycoca6 2>/dev/null || true
+    elif command -v kbuildsycoca5 &>/dev/null; then
+        kbuildsycoca5 2>/dev/null || true
+    elif command -v update-desktop-database &>/dev/null; then
+        update-desktop-database "$dir" 2>/dev/null || true
+    fi
+}
+
+# Read target/host/app/icon from an existing launcher and replace its icon
+# with a freshly copied copy from the remote host.
+refresh_desktop_icon() {
+    local file="$1"
+    if [[ ! -f "$file" ]]; then
+        echo "Error: Desktop file not found: $file" >&2
+        exit 1
+    fi
+
+    local exec_line
+    exec_line=$(sed -n 's/^Exec=//p' "$file" | head -n 1)
+    if [[ -z "$exec_line" ]]; then
+        echo "Error: No Exec= line found in $file" >&2
+        exit 1
+    fi
+
+    local -a tokens=()
+    mapfile -t tokens < <(tokenize_exec "$exec_line")
+    if [[ ${#tokens[@]} -lt 1 ]]; then
+        echo "Error: Could not parse Exec= line in $file" >&2
+        exit 1
+    fi
+
+    local target=""
+    local app=""
+    local icon_hint=""
+    local i
+    for ((i = 1; i < ${#tokens[@]}; i++)); do
+        case "${tokens[i]}" in
+            -t|--target)
+                target="${tokens[i + 1]:-}"
+                i=$((i + 1))
+                ;;
+            -H|--server-host)
+                i=$((i + 1))
+                ;;
+            -a|--app)
+                app="${tokens[i + 1]:-}"
+                i=$((i + 1))
+                ;;
+            -i|--icon)
+                icon_hint="${tokens[i + 1]:-}"
+                i=$((i + 1))
+                ;;
+            --bin-dir|-n|--name|-c|--comment|--categories)
+                i=$((i + 1))
+                ;;
+            -*)
+                ;;
+            *)
+                if [[ -z "$app" ]]; then
+                    app="${tokens[i]}"
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$target" || -z "$app" ]]; then
+        echo "Error: Could not determine target/app from Exec= line in $file" >&2
+        exit 1
+    fi
+
+    echo "Fetching icon for '${app}' from ${target}..."
+    local local_icon
+    if ! local_icon="$(fetch_remote_icon "$target" "$app" "$icon_hint")"; then
+        echo "Error: Could not fetch an icon for '${app}' from '${target}'." >&2
+        exit 1
+    fi
+
+    update_desktop_icon "$file" "$local_icon"
+    echo "Updated icon in ${file}: ${local_icon}"
+
+    refresh_desktop_database "$(dirname "$file")"
+}
+
+# Resolve the remote copy of this script. Returns an absolute path so that
+# waypipe's server does not have to rely on the non-interactive SSH PATH.
+resolve_remote_exe() {
+    local target="$1"
+    local bin_dir="$2"
+
+    ssh "$target" sh -s -- "$bin_dir" <<'REMOTE_SCRIPT'
+set -u
+
+bin_dir=$1
+case "$bin_dir" in
+    "~")
+        bin_dir=$HOME
+        ;;
+    "~/"*)
+        bin_dir=$HOME/${bin_dir#\~/}
+        ;;
+esac
+
+candidate="${bin_dir%/}/remote-app-pipe"
+if [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    exit 0
+fi
+
+if found=$(command -v remote-app-pipe 2>/dev/null); then
+    printf '%s\n' "$found"
+    exit 0
+fi
+
+printf '%s\n' "$candidate" >&2
+exit 1
+REMOTE_SCRIPT
+}
+
+# ---------------------------------------------------------
+# Parse Options
+# ---------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --deploy)
+            DEPLOY_SELF=true
+            shift
+            ;;
+        --bin-dir)
+            REMOTE_BIN_DIR="$2"
+            shift 2
+            ;;
+        -t|--target)
+            TARGET_NEBULA_HOST="$2"
+            shift 2
+            ;;
+        -H|--server-host)
+            SERVER_HOSTNAME="$2"
+            shift 2
+            ;;
+        -a|--app)
+            APP="$2"
+            shift 2
+            ;;
+        --server)
+            IS_SERVER=true
+            shift
+            ;;
+        --install-desktop)
+            INSTALL_DESKTOP=true
+            shift
+            ;;
+        --fetch-icon)
+            FETCH_ICON_MODE="always"
+            shift
+            ;;
+        --no-fetch-icon)
+            FETCH_ICON_MODE="never"
+            shift
+            ;;
+        --refresh-icon)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --refresh-icon requires a .desktop file path." >&2
+                usage
+            fi
+            REFRESH_ICON_FILE="$2"
+            shift 2
+            ;;
+        -n|--name)
+            DESKTOP_NAME="$2"
+            shift 2
+            ;;
+        -i|--icon)
+            DESKTOP_ICON="$2"
+            shift 2
+            ;;
+        -c|--comment)
+            DESKTOP_COMMENT="$2"
+            shift 2
+            ;;
+        --categories)
+            DESKTOP_CATEGORIES="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: Unknown option '$1'" >&2
+            usage
+            ;;
+        *)
+            if [[ -z "$APP" ]]; then
+                APP="$1"
+                shift
+                APP_ARGS=("$@")
+                break
+            else
+                APP_ARGS+=("$1")
+                shift
+            fi
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------
+# Icon Refresh Mode
+# ---------------------------------------------------------
+if [[ -n "$REFRESH_ICON_FILE" ]]; then
+    refresh_desktop_icon "$REFRESH_ICON_FILE"
+    exit 0
+fi
+
+# ---------------------------------------------------------
+# Self-Deployment Mode (via SCP)
+# ---------------------------------------------------------
+if [[ "$DEPLOY_SELF" == true ]]; then
+    if [[ -z "$TARGET_NEBULA_HOST" ]]; then
+        echo "Error: Target host (-t / --target) is required for --deploy." >&2
+        exit 1
+    fi
+
+    SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
+    SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
+
+    # Resolve the remote home directory so that ~ is expanded on the remote
+    # side. Quoting '~' in an ssh command would create a literal "~" directory.
+    REMOTE_HOME="$(ssh "$TARGET_NEBULA_HOST" 'printf %s "$HOME"')"
+    if [[ -z "$REMOTE_HOME" ]]; then
+        echo "Error: Could not determine the home directory on ${TARGET_NEBULA_HOST}." >&2
+        exit 1
+    fi
+    REMOTE_BIN_DIR_ABS="$(expand_remote_path "$REMOTE_BIN_DIR" "$REMOTE_HOME")"
+    REMOTE_DEST="${REMOTE_BIN_DIR_ABS%/}/${SCRIPT_NAME}"
+
+    echo "Deploying ${SCRIPT_PATH} to ${TARGET_NEBULA_HOST}:${REMOTE_DEST}..."
+    # The paths are expanded locally on purpose and shell-quoted for the remote shell.
+    # shellcheck disable=SC2029
+    ssh "$TARGET_NEBULA_HOST" "mkdir -p $(printf '%q' "$REMOTE_BIN_DIR_ABS")"
+    scp "$SCRIPT_PATH" "${TARGET_NEBULA_HOST}:${REMOTE_DEST}"
+    # shellcheck disable=SC2029
+    ssh "$TARGET_NEBULA_HOST" "chmod +x $(printf '%q' "$REMOTE_DEST")"
+
+    echo "Successfully deployed and made executable on ${TARGET_NEBULA_HOST}."
+    exit 0
+fi
+
+# ---------------------------------------------------------
+# Validation for Runtime & Desktop Modes
+# ---------------------------------------------------------
+if [[ "$IS_SERVER" == false && -z "$TARGET_NEBULA_HOST" ]]; then
+    echo "Error: Missing required parameter: -t / --target <nebula_host>" >&2
+    usage
+fi
+
+if [[ -z "$SERVER_HOSTNAME" ]]; then
+    echo "Error: Missing required parameter: -H / --server-host <server_hostname>" >&2
+    usage
+fi
+
+if [[ -z "$APP" ]]; then
+    echo "Error: No application specified." >&2
+    usage
+fi
+
+# ---------------------------------------------------------
+# Desktop Generator Mode
+# ---------------------------------------------------------
+if [[ "$INSTALL_DESKTOP" == true ]]; then
+    DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$DESKTOP_DIR"
+
+    FILE_TAG="${APP}-${TARGET_NEBULA_HOST}"
+    DESKTOP_FILE="${DESKTOP_DIR}/remote-${FILE_TAG}.desktop"
+
+    NAME="${DESKTOP_NAME:-${APP^} (${TARGET_NEBULA_HOST})}"
+    ICON="${DESKTOP_ICON:-$APP}"
+    COMMENT="${DESKTOP_COMMENT:-Launch $APP on $TARGET_NEBULA_HOST via Waypipe}"
+
+    LOCAL_ICON_PATH="$(find_local_icon "$ICON" || true)"
+
+    if [[ -n "$DESKTOP_ICON" && -z "$LOCAL_ICON_PATH" ]]; then
+        echo "Warning: icon '${ICON}' is not installed in the local icon themes." >&2
+    fi
+
+    SHOULD_FETCH=false
+    case "$FETCH_ICON_MODE" in
+        always)
+            SHOULD_FETCH=true
+            ;;
+        never)
+            ;;
+        auto)
+            if [[ -z "$LOCAL_ICON_PATH" ]]; then
+                SHOULD_FETCH=true
+            fi
+            ;;
+    esac
+
+    if [[ "$SHOULD_FETCH" == true ]]; then
+        echo "Looking up icon for '${APP}' on ${TARGET_NEBULA_HOST}..."
+        if FETCHED_ICON="$(fetch_remote_icon "$TARGET_NEBULA_HOST" "$APP" "$ICON")"; then
+            ICON="$FETCHED_ICON"
+            echo "Fetched icon: ${ICON}"
+        else
+            echo "Warning: could not fetch an icon for '${APP}' from ${TARGET_NEBULA_HOST}; keeping '${ICON}'." >&2
+        fi
+    fi
+
+    # Use the absolute path of this script in Exec=, so that desktop
+    # environments do not depend on ~/.local/bin being in their PATH.
+    LOCAL_EXE="$(realpath -s "${BASH_SOURCE[0]}")"
+    EXEC_LINE="$(desktop_exec_arg "$LOCAL_EXE") -t $(desktop_exec_arg "$TARGET_NEBULA_HOST") -H $(desktop_exec_arg "$SERVER_HOSTNAME")"
+    if [[ "$REMOTE_BIN_DIR" != "~/.local/bin" ]]; then
+        EXEC_LINE+=" --bin-dir $(desktop_exec_arg "$REMOTE_BIN_DIR")"
+    fi
+    EXEC_LINE+=" $(desktop_exec_arg "$APP") %U"
+
+    {
+        printf '[Desktop Entry]\n'
+        printf 'Name=%s\n' "$(desktop_field_value "$NAME")"
+        printf 'Comment=%s\n' "$(desktop_field_value "$COMMENT")"
+        printf 'Exec=%s\n' "$EXEC_LINE"
+        printf 'Icon=%s\n' "$ICON"
+        printf 'Terminal=false\n'
+        printf 'Type=Application\n'
+        printf 'Categories=%s\n' "$DESKTOP_CATEGORIES"
+        printf 'StartupNotify=true\n'
+    } > "$DESKTOP_FILE"
+
+    chmod +x "$DESKTOP_FILE"
+    echo "Installed desktop file: $DESKTOP_FILE"
+    echo "Icon: $ICON"
+
+    refresh_desktop_database "$DESKTOP_DIR"
+    exit 0
+fi
+
+# ---------------------------------------------------------
+# Execution Mode: Server vs. Client
+# ---------------------------------------------------------
+CURRENT_HOST="$(hostname)"
+
+if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_HOST" == "$SERVER_HOSTNAME" ]]; then
+
+    handover_instance() {
+        local proc_name="$1"
+        local pid
+        pid=$(pgrep -x "$proc_name" || true)
+
+        if [[ -n "$pid" ]]; then
+            local cur_disp="${WAYLAND_DISPLAY:-wayland-0}"
+            local proc_disp
+            proc_disp=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^WAYLAND_DISPLAY=' | cut -d= -f2 || true)
+
+            if [[ "$proc_disp" == "$cur_disp" && -n "$proc_disp" ]]; then
+                return 0
+            fi
+
+            kill -TERM "$pid" 2>/dev/null || true
+
+            for _ in {1..30}; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.2
+            done
+            sleep 0.3
+        fi
+    }
+
+    case "$APP" in
+        thunderbird)
+            handover_instance thunderbird
+            exec thunderbird "${APP_ARGS[@]}"
+            ;;
+
+        firefox)
+            if [[ "${APP_ARGS[*]:-}" == *"-P"* || "${APP_ARGS[*]:-}" == *"--profile"* ]]; then
+                exec firefox --no-remote "${APP_ARGS[@]}"
+            else
+                handover_instance firefox
+                exec firefox "${APP_ARGS[@]}"
+            fi
+            ;;
+
+        zed|zeditor)
+            exec zed "${APP_ARGS[@]}"
+            ;;
+
+        *)
+            exec "$APP" "${APP_ARGS[@]}"
+            ;;
+    esac
+
+else
+    # ---------------------------------------------------------
+    # Client Mode: Waypipe over Nebula
+    # ---------------------------------------------------------
+
+    # waypipe's server executes the remote command directly (execvp), so a
+    # bare "remote-app-pipe" only works if ~/.local/bin happens to be in the
+    # non-interactive SSH PATH. Resolve an absolute path instead.
+    if ! REMOTE_EXE="$(resolve_remote_exe "$TARGET_NEBULA_HOST" "$REMOTE_BIN_DIR")"; then
+        echo "Error: remote-app-pipe is not executable on ${TARGET_NEBULA_HOST}." >&2
+        echo "Looked for '${REMOTE_BIN_DIR}/remote-app-pipe' and in the remote PATH." >&2
+        echo "Deploy it first with: remote-app-pipe --deploy -t ${TARGET_NEBULA_HOST} --bin-dir '${REMOTE_BIN_DIR}'" >&2
+        exit 1
+    fi
+
+    exec waypipe --compress zstd=3 ssh -o ExitOnForwardFailure=yes "$TARGET_NEBULA_HOST" \
+        "$REMOTE_EXE" --server -H "$SERVER_HOSTNAME" "$APP" "${APP_ARGS[@]}"
+fi
