@@ -6,7 +6,7 @@ set -euo pipefail
 # ---------------------------------------------------------
 # Defaults & State Variables
 # ---------------------------------------------------------
-TARGET_NEBULA_HOST=""
+TARGET_HOST=""
 SERVER_HOSTNAME=""
 APP=""
 APP_ARGS=()
@@ -29,15 +29,15 @@ DESKTOP_CATEGORIES="Network;"
 usage() {
     cat <<EOF
 Usage:
-  remote-app-pipe -t <nebula_host> -H <server_hostname> <app> [app-args...]
-  remote-app-pipe --install-desktop -t <nebula_host> -H <server_hostname> -a <app> [options]
+  remote-app-pipe -t <target_host> -H <server_hostname> <app> [app-args...]
+  remote-app-pipe --install-desktop -t <target_host> -H <server_hostname> -a <app> [options]
   remote-app-pipe --refresh-icon <desktop-file>
-  remote-app-pipe --deploy -t <nebula_host> [--bin-dir <remote_path>]
+  remote-app-pipe --deploy -t <target_host> [--bin-dir <remote_path>]
 
 Modes:
   Launch:
-    -t, --target <host>          Nebula host / SSH alias of the target machine (REQUIRED)
-    -H, --server-host <hostname> Physical hostname of the server (as in \`hostname\`) (REQUIRED)
+    -t, --target <host>          SSH host or alias of the target machine (REQUIRED)
+    -H, --server-host <hostname> Physical hostname of the server (as in \`uname -n\`) (REQUIRED)
     <app>                        Application binary to run (thunderbird, zed, firefox, etc.)
     --bin-dir <path>             Remote binary folder used to launch this script (default: ~/.local/bin)
 
@@ -46,7 +46,7 @@ Modes:
     --bin-dir <path>             Remote binary folder (default: ~/.local/bin)
 
   Desktop Entry Generator:
-    --install-desktop            Generate a KDE/XDG .desktop launcher and register it
+    --install-desktop            Generate an XDG .desktop launcher and register it
     -a, --app <app>              Application binary name (REQUIRED with --install-desktop)
     -n, --name <name>            Display name for the launcher (default: "<App> (<Host>)")
     -i, --icon <icon>            Desktop icon name or absolute path (default: "<app>")
@@ -60,20 +60,20 @@ Modes:
                                  (target, host and app are read from its Exec= line)
 
 Examples:
-  # Deploy script to the university desktop:
-  remote-app-pipe --deploy -t uni-desktop-nebula
+  # Deploy script to the home desktop:
+  remote-app-pipe --deploy -t home-desktop
 
-  # Deploy script to home workstation with custom bin dir:
-  remote-app-pipe --deploy -t home-desktop-nebula --bin-dir /usr/local/bin
+  # Deploy script to a workstation with a custom bin dir:
+  remote-app-pipe --deploy -t work-desktop --bin-dir /usr/local/bin
 
-  # Launch Thunderbird on the university desktop:
-  remote-app-pipe -t uni-desktop-nebula -H uni-desktop thunderbird
+  # Launch Thunderbird on the work workstation:
+  remote-app-pipe -t work-desktop -H work-desktop thunderbird
 
-  # Generate a desktop launcher for Thunderbird on Uni desktop:
-  remote-app-pipe --install-desktop -t uni-desktop-nebula -H uni-desktop -a thunderbird -n "Thunderbird (Uni)"
+  # Generate a desktop launcher for Thunderbird on the work workstation:
+  remote-app-pipe --install-desktop -t work-desktop -H work-desktop -a thunderbird -n "Thunderbird (Work)"
 
   # Repair/refresh an existing launcher's icon:
-  remote-app-pipe --refresh-icon ~/.local/share/applications/remote-thunderbird-uni-desktop-nebula.desktop
+  remote-app-pipe --refresh-icon ~/.local/share/applications/remote-thunderbird-work-desktop.desktop
 EOF
     exit 1
 }
@@ -478,7 +478,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -t|--target)
-            TARGET_NEBULA_HOST="$2"
+            TARGET_HOST="$2"
             shift 2
             ;;
         -H|--server-host)
@@ -566,7 +566,7 @@ fi
 # Self-Deployment Mode (via SCP)
 # ---------------------------------------------------------
 if [[ "$DEPLOY_SELF" == true ]]; then
-    if [[ -z "$TARGET_NEBULA_HOST" ]]; then
+    if [[ -z "$TARGET_HOST" ]]; then
         echo "Error: Target host (-t / --target) is required for --deploy." >&2
         exit 1
     fi
@@ -576,31 +576,31 @@ if [[ "$DEPLOY_SELF" == true ]]; then
 
     # Resolve the remote home directory so that ~ is expanded on the remote
     # side. Quoting '~' in an ssh command would create a literal "~" directory.
-    REMOTE_HOME="$(ssh "$TARGET_NEBULA_HOST" 'printf %s "$HOME"')"
+    REMOTE_HOME="$(ssh "$TARGET_HOST" 'printf %s "$HOME"')"
     if [[ -z "$REMOTE_HOME" ]]; then
-        echo "Error: Could not determine the home directory on ${TARGET_NEBULA_HOST}." >&2
+        echo "Error: Could not determine the home directory on ${TARGET_HOST}." >&2
         exit 1
     fi
     REMOTE_BIN_DIR_ABS="$(expand_remote_path "$REMOTE_BIN_DIR" "$REMOTE_HOME")"
     REMOTE_DEST="${REMOTE_BIN_DIR_ABS%/}/${SCRIPT_NAME}"
 
-    echo "Deploying ${SCRIPT_PATH} to ${TARGET_NEBULA_HOST}:${REMOTE_DEST}..."
+    echo "Deploying ${SCRIPT_PATH} to ${TARGET_HOST}:${REMOTE_DEST}..."
     # The paths are expanded locally on purpose and shell-quoted for the remote shell.
     # shellcheck disable=SC2029
-    ssh "$TARGET_NEBULA_HOST" "mkdir -p $(printf '%q' "$REMOTE_BIN_DIR_ABS")"
-    scp "$SCRIPT_PATH" "${TARGET_NEBULA_HOST}:${REMOTE_DEST}"
+    ssh "$TARGET_HOST" "mkdir -p $(printf '%q' "$REMOTE_BIN_DIR_ABS")"
+    scp "$SCRIPT_PATH" "${TARGET_HOST}:${REMOTE_DEST}"
     # shellcheck disable=SC2029
-    ssh "$TARGET_NEBULA_HOST" "chmod +x $(printf '%q' "$REMOTE_DEST")"
+    ssh "$TARGET_HOST" "chmod +x $(printf '%q' "$REMOTE_DEST")"
 
-    echo "Successfully deployed and made executable on ${TARGET_NEBULA_HOST}."
+    echo "Successfully deployed and made executable on ${TARGET_HOST}."
     exit 0
 fi
 
 # ---------------------------------------------------------
 # Validation for Runtime & Desktop Modes
 # ---------------------------------------------------------
-if [[ "$IS_SERVER" == false && -z "$TARGET_NEBULA_HOST" ]]; then
-    echo "Error: Missing required parameter: -t / --target <nebula_host>" >&2
+if [[ "$IS_SERVER" == false && -z "$TARGET_HOST" ]]; then
+    echo "Error: Missing required parameter: -t / --target <target_host>" >&2
     usage
 fi
 
@@ -621,12 +621,12 @@ if [[ "$INSTALL_DESKTOP" == true ]]; then
     DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     mkdir -p "$DESKTOP_DIR"
 
-    FILE_TAG="${APP}-${TARGET_NEBULA_HOST}"
+    FILE_TAG="${APP}-${TARGET_HOST}"
     DESKTOP_FILE="${DESKTOP_DIR}/remote-${FILE_TAG}.desktop"
 
-    NAME="${DESKTOP_NAME:-${APP^} (${TARGET_NEBULA_HOST})}"
+    NAME="${DESKTOP_NAME:-${APP^} (${TARGET_HOST})}"
     ICON="${DESKTOP_ICON:-$APP}"
-    COMMENT="${DESKTOP_COMMENT:-Launch $APP on $TARGET_NEBULA_HOST via Waypipe}"
+    COMMENT="${DESKTOP_COMMENT:-Launch $APP on $TARGET_HOST via Waypipe}"
 
     LOCAL_ICON_PATH="$(find_local_icon "$ICON" || true)"
 
@@ -649,19 +649,19 @@ if [[ "$INSTALL_DESKTOP" == true ]]; then
     esac
 
     if [[ "$SHOULD_FETCH" == true ]]; then
-        echo "Looking up icon for '${APP}' on ${TARGET_NEBULA_HOST}..."
-        if FETCHED_ICON="$(fetch_remote_icon "$TARGET_NEBULA_HOST" "$APP" "$ICON")"; then
+        echo "Looking up icon for '${APP}' on ${TARGET_HOST}..."
+        if FETCHED_ICON="$(fetch_remote_icon "$TARGET_HOST" "$APP" "$ICON")"; then
             ICON="$FETCHED_ICON"
             echo "Fetched icon: ${ICON}"
         else
-            echo "Warning: could not fetch an icon for '${APP}' from ${TARGET_NEBULA_HOST}; keeping '${ICON}'." >&2
+            echo "Warning: could not fetch an icon for '${APP}' from ${TARGET_HOST}; keeping '${ICON}'." >&2
         fi
     fi
 
     # Use the absolute path of this script in Exec=, so that desktop
     # environments do not depend on ~/.local/bin being in their PATH.
     LOCAL_EXE="$(realpath -s "${BASH_SOURCE[0]}")"
-    EXEC_LINE="$(desktop_exec_arg "$LOCAL_EXE") -t $(desktop_exec_arg "$TARGET_NEBULA_HOST") -H $(desktop_exec_arg "$SERVER_HOSTNAME")"
+    EXEC_LINE="$(desktop_exec_arg "$LOCAL_EXE") -t $(desktop_exec_arg "$TARGET_HOST") -H $(desktop_exec_arg "$SERVER_HOSTNAME")"
     if [[ "$REMOTE_BIN_DIR" != "~/.local/bin" ]]; then
         EXEC_LINE+=" --bin-dir $(desktop_exec_arg "$REMOTE_BIN_DIR")"
     fi
@@ -690,7 +690,7 @@ fi
 # ---------------------------------------------------------
 # Execution Mode: Server vs. Client
 # ---------------------------------------------------------
-CURRENT_HOST="$(hostname)"
+CURRENT_HOST="$(uname -n)"
 
 if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_HOST" == "$SERVER_HOSTNAME" ]]; then
 
@@ -746,19 +746,19 @@ if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_
 
 else
     # ---------------------------------------------------------
-    # Client Mode: Waypipe over Nebula
+    # Client Mode: Waypipe over SSH
     # ---------------------------------------------------------
 
     # waypipe's server executes the remote command directly (execvp), so a
     # bare "remote-app-pipe" only works if ~/.local/bin happens to be in the
     # non-interactive SSH PATH. Resolve an absolute path instead.
-    if ! REMOTE_EXE="$(resolve_remote_exe "$TARGET_NEBULA_HOST" "$REMOTE_BIN_DIR")"; then
-        echo "Error: remote-app-pipe is not executable on ${TARGET_NEBULA_HOST}." >&2
+    if ! REMOTE_EXE="$(resolve_remote_exe "$TARGET_HOST" "$REMOTE_BIN_DIR")"; then
+        echo "Error: remote-app-pipe is not executable on ${TARGET_HOST}." >&2
         echo "Looked for '${REMOTE_BIN_DIR}/remote-app-pipe' and in the remote PATH." >&2
-        echo "Deploy it first with: remote-app-pipe --deploy -t ${TARGET_NEBULA_HOST} --bin-dir '${REMOTE_BIN_DIR}'" >&2
+        echo "Deploy it first with: remote-app-pipe --deploy -t ${TARGET_HOST} --bin-dir '${REMOTE_BIN_DIR}'" >&2
         exit 1
     fi
 
-    exec waypipe --compress zstd=3 ssh -o ExitOnForwardFailure=yes "$TARGET_NEBULA_HOST" \
+    exec waypipe --compress zstd=3 ssh -o ExitOnForwardFailure=yes "$TARGET_HOST" \
         "$REMOTE_EXE" --server -H "$SERVER_HOSTNAME" "$APP" "${APP_ARGS[@]}"
 fi
