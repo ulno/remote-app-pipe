@@ -9,7 +9,7 @@ It works over any SSH connection — a LAN, a private mesh such as Nebula, Tails
 ## Key Features
 
 * **Graceful Session Handover:** Detects when an app (e.g., Thunderbird) is already running on a physical or orphaned display, sends a `SIGTERM` to safely flush SQLite caches and remove `parent.lock`, and reclaims the session for the active Wayland context.
-* **Polymorphic Host Detection:** Compares the local node name (`uname -n`) against the required `--server-host` (`-H`). If executed on the target host, it runs locally without network overhead; otherwise, it establishes a Waypipe tunnel over SSH.
+* **Polymorphic Host Detection:** Compares the local node name (`uname -n`) against `--server-host` (`-H`). If executed on the target host, it runs locally without network overhead; otherwise, it establishes a Waypipe tunnel over SSH. `-H` defaults to the first DNS label of `-t`.
 * **Network-Optimized Waypipe:** Uses `zstd=3` compression over raw SSH to reduce latency across WAN, VPN, and mesh links without double-compression CPU overhead.
 * **Built-in Self-Deployment:** Pushes itself to any workstation's binary directory via `scp`.
 * **PATH-Independent Remote Launch:** Resolves the remote executable to an absolute path, so it works even though non-interactive SSH sessions usually do not include `~/.local/bin` in `PATH`.
@@ -66,6 +66,25 @@ remote-app-pipe --deploy -t work-desktop --bin-dir /usr/local/bin
 
 The target can be any SSH destination: a hostname, an SSH alias, an IP address, or a mesh/VPN name.
 
+### `-t` vs. `-H`
+
+`-t` is the SSH destination. `-H` is the physical hostname the remote machine reports through `uname -n`, used to detect when the script is already running on the target.
+
+`-H` is optional. By default it is derived from `-t` by taking the first DNS label:
+
+```text
+-t remote-host.mydomain.mesh   ->   -H remote-host
+-t work-desktop                ->   -H work-desktop
+```
+
+Override `-H` when your SSH alias or IP does not match the machine's hostname:
+
+```bash
+remote-app-pipe -t work-alias -H work-workstation zed
+```
+
+In `--server` mode, `-H` defaults to the local `uname -n`.
+
 ---
 
 ## Generating Desktop Launchers
@@ -89,7 +108,6 @@ Access a centralized mail profile from a laptop while travelling:
 ```bash
 remote-app-pipe --install-desktop \
   -t home-desktop \
-  -H home-desktop \
   -a thunderbird \
   -n "Thunderbird (Home)" \
   -i thunderbird \
@@ -104,7 +122,6 @@ Run an editor remotely while keeping GPU-accelerated local rendering:
 ```bash
 remote-app-pipe --install-desktop \
   -t work-desktop \
-  -H work-desktop \
   -a zed \
   -n "Zed (Work)" \
   -i zed \
@@ -119,7 +136,6 @@ Access services that are only reachable from the work network:
 ```bash
 remote-app-pipe --install-desktop \
   -t work-desktop \
-  -H work-desktop \
   -a firefox \
   -n "Firefox (Work)" \
   -i firefox \
@@ -137,16 +153,16 @@ Ad-hoc execution accepts files, URLs, and arbitrary command-line arguments:
 
 ```bash
 # Open a remote project folder in Zed on the home desktop:
-remote-app-pipe -t home-desktop -H home-desktop zed ~/projects/research
+remote-app-pipe -t home-desktop zed ~/projects/research
 
 # Open a work-restricted URL through the work workstation:
-remote-app-pipe -t work-desktop -H work-desktop firefox https://intranet.example.com
+remote-app-pipe -t work-desktop firefox https://intranet.example.com
 
 # Run an isolated Firefox profile without killing the main desktop instance:
-remote-app-pipe -t work-desktop -H work-desktop firefox -P WorkRemote --no-remote
+remote-app-pipe -t work-desktop firefox -P WorkRemote --no-remote
 
 # Open a remote file manager:
-remote-app-pipe -t home-desktop -H home-desktop dolphin ~/Documents
+remote-app-pipe -t home-desktop dolphin ~/Documents
 ```
 
 > Note: paths such as `~/projects` are expanded by your local shell before the command is sent. Use paths that exist on the remote host.
@@ -158,7 +174,7 @@ remote-app-pipe -t home-desktop -H home-desktop dolphin ~/Documents
 | Parameter | Type | Description |
 | --- | --- | --- |
 | `-t`, `--target` | Required* | SSH hostname, alias, IP, or mesh/VPN name of the target machine. |
-| `-H`, `--server-host` | Required | Physical hostname of the server (as reported by `uname -n`). |
+| `-H`, `--server-host` | Optional | Physical hostname of the server (as reported by `uname -n`). Default: derived from `-t` by taking its first DNS label. |
 | `<app>` / `-a` | Required | Binary executable name to invoke (`thunderbird`, `zed`, etc.). |
 | `--deploy` | Flag | Copies `remote-app-pipe` to the target host via `scp`. |
 | `--bin-dir <path>` | Optional | Remote directory for `--deploy` and for locating the remote binary at launch (Default: `~/.local/bin`). A leading `~` is expanded against the remote `$HOME`. |

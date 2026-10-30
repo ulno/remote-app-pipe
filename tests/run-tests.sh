@@ -96,6 +96,17 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local file="$1"
+    local needle="$2"
+    local desc="$3"
+    if grep -Fq -- "$needle" "$file" 2>/dev/null; then
+        not_ok "$desc (unexpected '$needle' in $file)"
+    else
+        ok "$desc"
+    fi
+}
+
 assert_no_line() {
     local file="$1"
     local line="$2"
@@ -219,13 +230,37 @@ test_help() {
 
 test_validation() {
     begin_test "validation errors"
-    run_app --install-desktop -t "$TARGET" -a betterbird > "$WORK/out" 2>&1
-    assert_eq 1 "$?" "missing -H is rejected"
-    assert_contains "$WORK/out" 'Missing required parameter: -H' "missing -H error is clear"
+    run_app --install-desktop -a betterbird > "$WORK/out" 2>&1
+    assert_eq 1 "$?" "missing -t is rejected"
+    assert_contains "$WORK/out" 'Missing required parameter: -t' "missing -t error is clear"
 
-    run_app -t "$TARGET" -H "$SERVER_HOST" > "$WORK/out" 2>&1
+    run_app -t "$TARGET" > "$WORK/out" 2>&1
     assert_eq 1 "$?" "missing app is rejected"
     assert_contains "$WORK/out" 'No application specified' "missing app error is clear"
+}
+
+test_host_derivation() {
+    begin_test "server hostname is derived from the target"
+    reset_env
+    make_remote_betterbird
+    install_remote_binary
+
+    local target="remote-host.mydomain.mesh"
+    run_app --install-desktop --no-fetch-icon \
+        -t "$target" -a betterbird -i betterbird > "$WORK/out" 2>&1
+    assert_eq 0 "$?" "install without -H exits successfully"
+
+    local desktop="$LOCAL_HOME/.local/share/applications/remote-betterbird-${target}.desktop"
+    assert_file "$desktop" "desktop file created without -H"
+    assert_contains "$desktop" '-H "remote-host"' "Exec records the derived hostname"
+    assert_not_contains "$desktop" '-H "remote-host.mydomain.mesh"' "Exec does not use the full target as -H"
+
+    run_app -t "$target" betterbird > "$WORK/out" 2>&1
+    assert_eq 0 "$?" "launch without -H exits successfully"
+
+    local derived
+    derived="$(grep -A1 -Fx -- '-H' "$WORK/waypipe.args" | tail -n 1)"
+    assert_eq "remote-host" "$derived" "launch derives -H from the target"
 }
 
 test_desktop_install_and_icon_fetch() {
@@ -368,7 +403,7 @@ printf '%s\n' "\$@" > "$WORK/fakeapp.args"
 EOF
     chmod +x "$BIN/fakeapp"
 
-    run_app --server -H "$SERVER_HOST" fakeapp 'arg one' 'arg two' > "$WORK/out" 2>&1
+    run_app --server fakeapp 'arg one' 'arg two' > "$WORK/out" 2>&1
     assert_eq 0 "$?" "server mode exits successfully"
     assert_file "$WORK/fakeapp.args" "app was executed"
     assert_contains "$WORK/fakeapp.args" 'arg one' "first app argument passed"
@@ -380,6 +415,7 @@ EOF
 # ---------------------------------------------------------
 test_help
 test_validation
+test_host_derivation
 test_desktop_install_and_icon_fetch
 test_no_fetch_icon
 test_refresh_icon

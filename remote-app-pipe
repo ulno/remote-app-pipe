@@ -29,15 +29,16 @@ DESKTOP_CATEGORIES="Network;"
 usage() {
     cat <<EOF
 Usage:
-  remote-app-pipe -t <target_host> -H <server_hostname> <app> [app-args...]
-  remote-app-pipe --install-desktop -t <target_host> -H <server_hostname> -a <app> [options]
+  remote-app-pipe -t <target_host> [-H <server_hostname>] <app> [app-args...]
+  remote-app-pipe --install-desktop -t <target_host> [-H <server_hostname>] -a <app> [options]
   remote-app-pipe --refresh-icon <desktop-file>
   remote-app-pipe --deploy -t <target_host> [--bin-dir <remote_path>]
 
 Modes:
   Launch:
     -t, --target <host>          SSH host or alias of the target machine (REQUIRED)
-    -H, --server-host <hostname> Physical hostname of the server (as in \`uname -n\`) (REQUIRED)
+    -H, --server-host <hostname> Physical hostname of the server (optional; default: derived from -t,
+                                 e.g. remote-host.mydomain.mesh -> remote-host)
     <app>                        Application binary to run (thunderbird, zed, firefox, etc.)
     --bin-dir <path>             Remote binary folder used to launch this script (default: ~/.local/bin)
 
@@ -57,7 +58,7 @@ Modes:
     --fetch-icon                 Always pull the app icon from the remote host
     --no-fetch-icon              Never pull icons automatically
     --refresh-icon <file>        Re-fetch the icon for an existing .desktop file
-                                 (target, host and app are read from its Exec= line)
+                                 (target and app are read from its Exec= line)
 
 Examples:
   # Deploy script to the home desktop:
@@ -67,10 +68,10 @@ Examples:
   remote-app-pipe --deploy -t work-desktop --bin-dir /usr/local/bin
 
   # Launch Thunderbird on the work workstation:
-  remote-app-pipe -t work-desktop -H work-desktop thunderbird
+  remote-app-pipe -t work-desktop thunderbird
 
   # Generate a desktop launcher for Thunderbird on the work workstation:
-  remote-app-pipe --install-desktop -t work-desktop -H work-desktop -a thunderbird -n "Thunderbird (Work)"
+  remote-app-pipe --install-desktop -t work-desktop -a thunderbird -n "Thunderbird (Work)"
 
   # Repair/refresh an existing launcher's icon:
   remote-app-pipe --refresh-icon ~/.local/share/applications/remote-thunderbird-work-desktop.desktop
@@ -97,6 +98,32 @@ expand_remote_path() {
             printf '%s\n' "$path"
             ;;
     esac
+}
+
+# Derive the physical server hostname from an SSH target such as
+# remote-host.mydomain.mesh -> remote-host. user@ and :port are removed;
+# IP literals are kept as-is because they cannot be shortened meaningfully.
+derive_server_host_from_target() {
+    local target="$1"
+    target="${target#*@}"
+
+    # IPv6 literal (with or without a port): leave it alone.
+    if [[ "$target" == *:*:* ]]; then
+        printf '%s\n' "$target"
+        return
+    fi
+
+    # host:port -> host
+    target="${target%%:*}"
+
+    # IPv4 literal: leave it alone.
+    if [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s\n' "$target"
+        return
+    fi
+
+    # remote-host.mydomain.mesh -> remote-host
+    printf '%s\n' "${target%%.*}"
 }
 
 # Locate an icon in the local XDG icon theme / pixmap directories.
@@ -605,7 +632,15 @@ if [[ "$IS_SERVER" == false && -z "$TARGET_HOST" ]]; then
 fi
 
 if [[ -z "$SERVER_HOSTNAME" ]]; then
-    echo "Error: Missing required parameter: -H / --server-host <server_hostname>" >&2
+    if [[ -n "$TARGET_HOST" ]]; then
+        SERVER_HOSTNAME="$(derive_server_host_from_target "$TARGET_HOST")"
+    else
+        SERVER_HOSTNAME="$(uname -n)"
+    fi
+fi
+
+if [[ -z "$SERVER_HOSTNAME" ]]; then
+    echo "Error: Could not determine the server hostname; pass -H / --server-host." >&2
     usage
 fi
 
