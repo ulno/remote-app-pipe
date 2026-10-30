@@ -41,7 +41,7 @@ usage() {
     cat <<EOF
 Usage:
   remote-app-pipe -t <target_host> [-H <server_hostname>] <app> [app-args...]
-  remote-app-pipe --install-desktop -t <target_host> [-H <server_hostname>] -a <app> [options]
+  remote-app-pipe --install-desktop -t <target_host> [-H <server_hostname>] <app> [options]
   remote-app-pipe --refresh-icon <desktop-file>
   remote-app-pipe --deploy -t <target_host> [--bin-dir <remote_path>]
 
@@ -61,7 +61,7 @@ Modes:
 
   Desktop Entry Generator:
     --install-desktop            Generate an XDG .desktop launcher and register it
-    -a, --app <app>              Application binary name (REQUIRED with --install-desktop)
+    -a, --app <app>              Application binary name (optional if passed positionally)
     -n, --name <name>            Display name for the launcher (default: "<App> (<Host>)")
     -i, --icon <icon>            Desktop icon name or absolute path (default: "<app>")
     -c, --comment <comment>      Description comment
@@ -74,17 +74,19 @@ Modes:
                                  (target and app are read from its Exec= line)
 
 Examples:
+  # Recommended: test ad hoc first, then install a launcher if it works.
+  remote-app-pipe -t work-desktop thunderbird
+  remote-app-pipe --install-desktop -t work-desktop thunderbird
+  # Add --debug to the first command if something goes wrong.
+
   # Deploy script to the home desktop:
   remote-app-pipe --deploy -t home-desktop
 
   # Deploy script to a workstation with a custom bin dir:
   remote-app-pipe --deploy -t work-desktop --bin-dir /usr/local/bin
 
-  # Launch Thunderbird on the work workstation:
-  remote-app-pipe -t work-desktop thunderbird
-
-  # Generate a desktop launcher for Thunderbird on the work workstation:
-  remote-app-pipe --install-desktop -t work-desktop -a thunderbird -n "Thunderbird (Work)"
+  # Install with a custom menu name and icon:
+  remote-app-pipe --install-desktop -t work-desktop -a thunderbird -n "Thunderbird (Work)" -i thunderbird
 
   # Repair/refresh an existing launcher's icon:
   remote-app-pipe --refresh-icon ~/.local/share/applications/remote-thunderbird-work-desktop.desktop
@@ -676,6 +678,11 @@ while [[ $# -gt 0 ]]; do
             if [[ -z "$APP" ]]; then
                 APP="$1"
                 shift
+                # In desktop mode the app is not executed, so keep parsing
+                # options that follow the positional app name.
+                if [[ "$INSTALL_DESKTOP" == true ]]; then
+                    continue
+                fi
                 APP_ARGS=("$@")
                 break
             else

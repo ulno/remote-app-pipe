@@ -87,6 +87,49 @@ In `--server` mode, `-H` defaults to the local `uname -n`.
 
 ---
 
+## Default Workflow: Test First, Then Install
+
+The intended workflow is to try the app ad hoc first and install a desktop launcher only after it works.
+
+### 1. Test the app
+
+```bash
+remote-app-pipe -t home-desktop betterbird
+```
+
+If the window appears, you are done testing. Some apps print environment warnings, for example:
+
+```text
+Betterbird: Detected desktop environment no-DE.
+```
+
+That line comes from the app, not from `remote-app-pipe`. Waypipe does not provide the same desktop-environment identity as a local session, so the app may report `no-DE` even though it works normally. If the app does not appear, or you want to see the handover and launch decisions, rerun with:
+
+```bash
+remote-app-pipe --debug -t home-desktop betterbird
+```
+
+### 2. Install the launcher
+
+Once the ad-hoc launch works, create the menu entry:
+
+```bash
+remote-app-pipe --install-desktop -t home-desktop betterbird
+```
+
+Typical output:
+
+```text
+Looking up icon for 'betterbird' on home-desktop...
+Fetched icon: /home/you/.local/share/icons/remote-app-pipe/betterbird-betterbird.png
+Installed desktop file: /home/you/.local/share/applications/remote-betterbird-home-desktop.desktop
+Icon: /home/you/.local/share/icons/remote-app-pipe/betterbird-betterbird.png
+```
+
+This short form uses the app name positionally, fetches the remote icon automatically, and writes an XDG launcher. Add `-n`, `-i`, `-c`, or `--categories` for customization; `-a <app>` is an equivalent explicit form.
+
+---
+
 ## Session Handover
 
 Before launching a remote app, `remote-app-pipe` looks for an existing instance owned by the same user. The match is generic:
@@ -109,7 +152,7 @@ The handover timeout can be changed on the server with the `REMOTE_APP_PIPE_HAND
 
 ## Generating Desktop Launchers
 
-Run `--install-desktop` once on each client machine to generate launchers. Because the script checks the local node name at runtime, the same launcher runs natively when you are at the host and connects over Waypipe when you are roaming.
+After the ad-hoc test works, run `--install-desktop` once on each client machine to generate launchers. Because the script checks the local node name at runtime, the same launcher runs natively when you are at the host and connects over Waypipe when you are roaming.
 
 `--install-desktop` also looks for the requested icon in the local icon themes. If it is not installed locally, it asks the remote host for the app's `.desktop` entry, resolves the icon named in its `Icon=` key, copies it to `~/.local/share/icons/remote-app-pipe/`, and stores that absolute path in the launcher. Use `--no-fetch-icon` to disable this, or `--fetch-icon` to force a refresh.
 
@@ -169,7 +212,7 @@ The same pattern works for a home server, a workstation in the office, or any ot
 
 ## CLI Usage
 
-Ad-hoc execution accepts files, URLs, and arbitrary command-line arguments:
+These are the ad-hoc commands used in step 1 of the default workflow. They accept files, URLs, and arbitrary command-line arguments:
 
 ```bash
 # Open a remote project folder in Zed on the home desktop:
@@ -253,6 +296,10 @@ remote-app-pipe --debug -t home-desktop betterbird 2>remote-app-pipe-debug.log
 ```
 
 If the application is already on the same Waypipe display, handover deliberately leaves it running. If it is still running after `SIGTERM`, the debug output says so and the client dialog reports the remaining processes; close them manually or use `--no-handover` for that app.
+
+### The app prints "Detected desktop environment no-DE"
+
+That message comes from the application (Betterbird in the example), not from `remote-app-pipe`. Waypipe does not expose the same desktop-environment identity as a local session, so apps can report `no-DE` while still working normally. Ignore it if the window works; if it does not, rerun with `--debug`.
 
 ### `Failed to run program "remote-app-pipe": No such file or directory`
 

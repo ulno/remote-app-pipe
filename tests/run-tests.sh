@@ -317,7 +317,7 @@ test_no_fetch_icon() {
 
     run_app --install-desktop --no-fetch-icon \
         -t "$TARGET" -H "$SERVER_HOST" \
-        -a betterbird -i bettrbird > "$WORK/out" 2>&1
+        betterbird -i bettrbird > "$WORK/out" 2>&1
     assert_eq 0 "$?" "install exits successfully"
 
     local desktop="$LOCAL_HOME/.local/share/applications/remote-betterbird-${TARGET}.desktop"
@@ -409,7 +409,7 @@ test_custom_bin_dir_in_desktop_exec() {
 
     run_app --install-desktop --no-fetch-icon \
         -t "$TARGET" -H "$SERVER_HOST" \
-        -a betterbird -i betterbird --bin-dir '~/custom-bin' \
+        betterbird -i betterbird --bin-dir '~/custom-bin' \
         > "$WORK/out" 2>&1
     assert_eq 0 "$?" "install exits successfully"
 
