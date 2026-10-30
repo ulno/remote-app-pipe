@@ -298,6 +298,7 @@ test_desktop_install_and_icon_fetch() {
     assert_file "$desktop" "desktop file created"
     assert_contains "$desktop" 'Name=Betterbird (Home)' "desktop name written"
     assert_contains "$desktop" 'Categories=Network;Email;' "desktop categories written"
+    assert_contains "$desktop" 'StartupWMClass=eu.betterbird.Betterbird' "desktop taskbar class matches the remote app-id"
     assert_contains "$desktop" "\"$APP\"" "Exec uses the absolute local script path"
     assert_contains "$desktop" " -t \"${TARGET}\"" "Exec contains the target"
     assert_contains "$WORK/out" 'Fetched icon:' "install reports the fetched icon"
@@ -322,6 +323,7 @@ test_no_fetch_icon() {
 
     local desktop="$LOCAL_HOME/.local/share/applications/remote-betterbird-${TARGET}.desktop"
     assert_contains "$desktop" 'Icon=bettrbird' "explicit icon is kept"
+    assert_contains "$desktop" 'StartupWMClass=eu.betterbird.Betterbird' "taskbar class is still resolved"
     assert_no_file "$LOCAL_HOME/.local/share/icons/remote-app-pipe" "no icon was copied"
 }
 
@@ -347,6 +349,7 @@ EOF
     local icon
     icon="$(sed -n 's/^Icon=//p' "$desktop" | head -n 1)"
     assert_file "$icon" "refreshed icon exists locally"
+    assert_contains "$desktop" 'StartupWMClass=eu.betterbird.Betterbird' "refresh also repairs the taskbar class"
 
     run_app --refresh-icon "$WORK/does-not-exist.desktop" > "$WORK/out" 2>&1
     assert_eq 1 "$?" "refresh rejects a missing desktop file"
@@ -415,6 +418,20 @@ test_custom_bin_dir_in_desktop_exec() {
 
     local desktop="$LOCAL_HOME/.local/share/applications/remote-betterbird-${TARGET}.desktop"
     assert_contains "$desktop" '--bin-dir "~/custom-bin"' "Exec contains --bin-dir"
+}
+
+test_startup_wm_class_override() {
+    begin_test "StartupWMClass override"
+    reset_env
+
+    run_app --install-desktop --no-fetch-icon \
+        -t "$TARGET" -H "$SERVER_HOST" \
+        betterbird -i betterbird --startup-wm-class 'org.example.Betterbird' \
+        > "$WORK/out" 2>&1
+    assert_eq 0 "$?" "install with override exits successfully"
+
+    local desktop="$LOCAL_HOME/.local/share/applications/remote-betterbird-${TARGET}.desktop"
+    assert_contains "$desktop" 'StartupWMClass=org.example.Betterbird' "override is written to the launcher"
 }
 
 test_debug_and_generic_handover() {
@@ -536,6 +553,7 @@ test_launch_resolves_absolute_remote_path
 test_launch_missing_remote_binary
 test_deploy_expands_remote_home
 test_custom_bin_dir_in_desktop_exec
+test_startup_wm_class_override
 test_no_handover
 test_debug_and_generic_handover
 test_handover_failure_remote

@@ -124,6 +124,7 @@ Looking up icon for 'betterbird' on home-desktop...
 Fetched icon: /home/you/.local/share/icons/remote-app-pipe/betterbird-betterbird.png
 Installed desktop file: /home/you/.local/share/applications/remote-betterbird-home-desktop.desktop
 Icon: /home/you/.local/share/icons/remote-app-pipe/betterbird-betterbird.png
+StartupWMClass: eu.betterbird.Betterbird
 ```
 
 This short form uses the app name positionally, fetches the remote icon automatically, and writes an XDG launcher. Add `-n`, `-i`, `-c`, or `--categories` for customization; `-a <app>` is an equivalent explicit form.
@@ -150,9 +151,39 @@ The handover timeout can be changed on the server with the `REMOTE_APP_PIPE_HAND
 
 ---
 
+## KDE Taskbar Icons and Names
+
+KDE Plasma does not take a running window's taskbar icon from the process itself. Under Wayland it matches the window's **app-id** (for example `eu.betterbird.Betterbird`) to a `.desktop` file. Waypipe forwards the remote app-id correctly, but a launcher named `remote-betterbird-home-desktop.desktop` does not match that id by filename, so KDE falls back to the generic Wayland icon and shows `waypipe`.
+
+The installer therefore reads the remote app's `.desktop` filename and writes:
+
+```ini
+StartupWMClass=eu.betterbird.Betterbird
+```
+
+That lets KDE associate the running window with the generated launcher, so the taskbar uses the same downloaded icon and the launcher's `Name`.
+
+For existing launchers, repair both the icon and the taskbar class with:
+
+```bash
+remote-app-pipe --refresh-icon ~/.local/share/applications/remote-betterbird-home-desktop.desktop
+```
+
+If an app reports an app-id that differs from its remote `.desktop` filename, override it explicitly:
+
+```bash
+remote-app-pipe --install-desktop -t home-desktop betterbird --startup-wm-class 'org.example.Betterbird'
+```
+
+KDE may keep a cached association until the app is restarted or `kbuildsycoca6` runs; `--refresh-icon` runs the latter automatically.
+
+---
+
 ## Generating Desktop Launchers
 
 After the ad-hoc test works, run `--install-desktop` once on each client machine to generate launchers. Because the script checks the local node name at runtime, the same launcher runs natively when you are at the host and connects over Waypipe when you are roaming.
+
+The generated entry includes a `StartupWMClass` derived from the remote app's `.desktop` filename, so KDE can use the same icon and name for the running window in the taskbar.
 
 `--install-desktop` also looks for the requested icon in the local icon themes. If it is not installed locally, it asks the remote host for the app's `.desktop` entry, resolves the icon named in its `Icon=` key, copies it to `~/.local/share/icons/remote-app-pipe/`, and stores that absolute path in the launcher. Use `--no-fetch-icon` to disable this, or `--fetch-icon` to force a refresh.
 
@@ -251,7 +282,8 @@ remote-app-pipe --debug -t home-desktop thunderbird
 | `--categories` | Optional | XDG category string (Default: `Network;`). |
 | `--fetch-icon` | Flag | Always pull the app icon from the remote host. |
 | `--no-fetch-icon` | Flag | Never pull icons automatically. |
-| `--refresh-icon <file>` | Optional | Re-fetch the icon for an existing `.desktop` file. |
+| `--refresh-icon <file>` | Optional | Re-fetch the icon and `StartupWMClass` for an existing `.desktop` file. |
+| `--startup-wm-class <class>` | Optional | Override the taskbar app-id written to `StartupWMClass` (Default: remote `.desktop` id). |
 | `-d`, `--debug` | Flag | Print local and remote debugging information. Also enables waypipe debug logging. |
 | `--no-handover` | Flag | Do not stop an existing instance before launching. Recorded in `--install-desktop` launchers. |
 
@@ -273,7 +305,7 @@ or:
 make test
 ```
 
-The tests cover desktop generation, icon fetching and refresh, deployment path handling, `-H` derivation, absolute remote binary resolution, argument quoting, debug output, generic process-tree handover, `--no-handover`, handover failure reporting/dialogs, server-mode execution, and validation errors.
+The tests cover desktop generation, icon fetching and refresh, `StartupWMClass` derivation/override, deployment path handling, `-H` derivation, absolute remote binary resolution, argument quoting, debug output, generic process-tree handover, `--no-handover`, handover failure reporting/dialogs, server-mode execution, and validation errors.
 
 ---
 

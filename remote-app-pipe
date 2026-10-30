@@ -36,6 +36,7 @@ DESKTOP_NAME=""
 DESKTOP_ICON=""
 DESKTOP_COMMENT=""
 DESKTOP_CATEGORIES="Network;"
+STARTUP_WM_CLASS_OVERRIDE=""
 
 usage() {
     cat <<EOF
@@ -66,11 +67,12 @@ Modes:
     -i, --icon <icon>            Desktop icon name or absolute path (default: "<app>")
     -c, --comment <comment>      Description comment
     --categories <cat>           Desktop categories (default: "Network;")
+    --startup-wm-class <class>   Override the taskbar app-id (default: remote .desktop id)
 
   Icon handling:
     --fetch-icon                 Always pull the app icon from the remote host
     --no-fetch-icon              Never pull icons automatically
-    --refresh-icon <file>        Re-fetch the icon for an existing .desktop file
+    --refresh-icon <file>        Re-fetch the icon and StartupWMClass for an existing .desktop file
                                  (target and app are read from its Exec= line)
 
 Examples:
@@ -259,8 +261,9 @@ find_local_icon() {
     return 1
 }
 
-# Ask the remote host which icon its .desktop entry uses and where that icon
-# actually lives. Prints "<icon-name><TAB><icon-path>" (path may be empty).
+# Ask the remote host which .desktop entry belongs to the app, which icon
+# that entry uses, and where the icon actually lives. Prints
+# "<desktop-id><TAB><icon-name><TAB><icon-path>" (fields may be empty).
 remote_icon_lookup() {
     local target="$1"
     local app="$2"
@@ -314,7 +317,10 @@ if [ -z "$desktop" ]; then
 fi
 
 icon=""
+desktop_id=""
 if [ -n "$desktop" ]; then
+    desktop_id=$(basename "$desktop")
+    desktop_id=${desktop_id%.desktop}
     icon=$(sed -n 's/^Icon=//p' "$desktop" | head -n 1)
 fi
 [ -n "$icon" ] || icon="$hint"
@@ -323,9 +329,10 @@ fi
 case "$icon" in
     /*)
         if [ -f "$icon" ]; then
-            printf '%s\t%s\n' "$icon" "$icon"
+            printf '%s\t%s\t%s\n' "$desktop_id" "$icon" "$icon"
             exit 0
         fi
+        icon=$(basename "$icon")
         ;;
 esac
 
@@ -345,29 +352,24 @@ for ext in svg png xpm; do
         matches=$(find -L "$d" -type f -name "$icon.$ext" -printf '%s %p\n' 2>/dev/null || true)
         if [ -n "$matches" ]; then
             best=$(printf '%s\n' "$matches" | sort -nr | head -n 1 | cut -d' ' -f2-)
-            printf '%s\t%s\n' "$icon" "$best"
+            printf '%s\t%s\t%s\n' "$desktop_id" "$icon" "$best"
             exit 0
         fi
     done
 done
 
-printf '%s\t\n' "$icon"
+printf '%s\t%s\t\n' "$desktop_id" "$icon"
 REMOTE_SCRIPT
 }
 
-# Copy the remote app's icon into the local icon store and print its path.
-# Returns 1 if no icon could be found or copied.
-fetch_remote_icon() {
+# Copy a resolved remote icon file into the local icon store and print the
+# local path. Returns 1 if the file could not be copied.
+copy_remote_icon() {
     local target="$1"
     local app="$2"
-    local hint="${3:-}"
-    local lookup icon_name icon_path
-
-    lookup="$(remote_icon_lookup "$target" "$app" "$hint")" || return 1
-    IFS=$'\t' read -r icon_name icon_path <<< "$lookup"
+    local icon_path="$3"
 
     if [[ -z "$icon_path" ]]; then
-        echo "No icon file found on ${target} for app '${app}' (icon name: '${icon_name}')." >&2
         return 1
     fi
 
@@ -465,6 +467,19 @@ update_desktop_icon() {
     fi
 }
 
+update_desktop_startup_wm_class() {
+    local file="$1"
+    local wm_class="$2"
+    local escaped
+
+    escaped=$(printf '%s' "$wm_class" | sed 's/[\\&|]/\\&/g')
+    if grep -q '^StartupWMClass=' "$file"; then
+        sed -i "s|^StartupWMClass=.*|StartupWMClass=${escaped}|" "$file"
+    else
+        sed -i "/^\[Desktop Entry\]/a StartupWMClass=${escaped}" "$file"
+    fi
+}
+
 refresh_desktop_database() {
     local dir="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/applications}"
     if command -v kbuildsycoca6 &>/dev/null; then
@@ -539,14 +554,35 @@ refresh_desktop_icon() {
     fi
 
     echo "Fetching icon for '${app}' from ${target}..."
-    local local_icon
-    if ! local_icon="$(fetch_remote_icon "$target" "$app" "$icon_hint")"; then
-        echo "Error: Could not fetch an icon for '${app}' from '${target}'." >&2
+    local remote_info desktop_id icon_name icon_path local_icon
+    if ! remote_info="$(remote_icon_lookup "$target" "$app" "$icon_hint")"; then
+        echo "Error: Could not query the desktop entry for '${app}' on '${target}'." >&2
+        exit 1
+    fi
+    IFS=$'\t' read -r desktop_id icon_name icon_path <<< "$remote_info"
+
+    if [[ -z "$icon_path" ]]; then
+        echo "Error: No icon file found on '${target}' for app '${app}' (icon name: '${icon_name}')." >&2
+        exit 1
+    fi
+
+    if ! local_icon="$(copy_remote_icon "$target" "$app" "$icon_path")"; then
+        echo "Error: Could not copy the icon for '${app}' from '${target}'." >&2
         exit 1
     fi
 
     update_desktop_icon "$file" "$local_icon"
     echo "Updated icon in ${file}: ${local_icon}"
+
+    if [[ -n "$STARTUP_WM_CLASS_OVERRIDE" ]]; then
+        desktop_id="$STARTUP_WM_CLASS_OVERRIDE"
+    fi
+    if [[ -n "$desktop_id" ]]; then
+        update_desktop_startup_wm_class "$file" "$desktop_id"
+        echo "Updated StartupWMClass in ${file}: ${desktop_id}"
+    else
+        echo "Warning: could not determine the remote app-id; StartupWMClass was left unchanged." >&2
+    fi
 
     refresh_desktop_database "$(dirname "$file")"
 }
@@ -661,6 +697,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --categories)
             DESKTOP_CATEGORIES="$2"
+            shift 2
+            ;;
+        --startup-wm-class)
+            STARTUP_WM_CLASS_OVERRIDE="$2"
             shift 2
             ;;
         -h|--help)
@@ -799,13 +839,40 @@ if [[ "$INSTALL_DESKTOP" == true ]]; then
 
     if [[ "$SHOULD_FETCH" == true ]]; then
         echo "Looking up icon for '${APP}' on ${TARGET_HOST}..."
-        if FETCHED_ICON="$(fetch_remote_icon "$TARGET_HOST" "$APP" "$ICON")"; then
-            ICON="$FETCHED_ICON"
-            echo "Fetched icon: ${ICON}"
+    fi
+
+    # The remote .desktop file name is also the Wayland app-id KDE uses for
+    # taskbar grouping. Resolve it even when the icon is not copied locally.
+    REMOTE_DESKTOP_ID=""
+    REMOTE_ICON_NAME=""
+    REMOTE_ICON_PATH=""
+    REMOTE_INFO=""
+    if REMOTE_INFO="$(remote_icon_lookup "$TARGET_HOST" "$APP" "$ICON" 2>/dev/null)"; then
+        IFS=$'\t' read -r REMOTE_DESKTOP_ID REMOTE_ICON_NAME REMOTE_ICON_PATH <<< "$REMOTE_INFO"
+    fi
+    debug "remote desktop id='${REMOTE_DESKTOP_ID:-<none>}' icon path='${REMOTE_ICON_PATH:-<none>}'"
+
+    if [[ "$SHOULD_FETCH" == true ]]; then
+        if [[ -n "$REMOTE_ICON_PATH" ]]; then
+            if FETCHED_ICON="$(copy_remote_icon "$TARGET_HOST" "$APP" "$REMOTE_ICON_PATH")"; then
+                ICON="$FETCHED_ICON"
+                echo "Fetched icon: ${ICON}"
+            else
+                echo "Warning: could not copy an icon for '${APP}' from ${TARGET_HOST}; keeping '${ICON}'." >&2
+            fi
         else
-            echo "Warning: could not fetch an icon for '${APP}' from ${TARGET_HOST}; keeping '${ICON}'." >&2
+            echo "Warning: no icon file found on ${TARGET_HOST} for '${APP}' (icon name: '${REMOTE_ICON_NAME:-$ICON}'); keeping '${ICON}'." >&2
         fi
     fi
+
+    if [[ -n "$STARTUP_WM_CLASS_OVERRIDE" ]]; then
+        STARTUP_WM_CLASS="$STARTUP_WM_CLASS_OVERRIDE"
+    elif [[ -n "$REMOTE_DESKTOP_ID" ]]; then
+        STARTUP_WM_CLASS="$REMOTE_DESKTOP_ID"
+    else
+        STARTUP_WM_CLASS="${APP##*/}"
+    fi
+    debug "desktop StartupWMClass='${STARTUP_WM_CLASS}'"
 
     # Use the absolute path of this script in Exec=, so that desktop
     # environments do not depend on ~/.local/bin being in their PATH.
@@ -827,6 +894,7 @@ if [[ "$INSTALL_DESKTOP" == true ]]; then
         printf 'Icon=%s\n' "$ICON"
         printf 'Terminal=false\n'
         printf 'Type=Application\n'
+        printf 'StartupWMClass=%s\n' "$(desktop_field_value "$STARTUP_WM_CLASS")"
         printf 'Categories=%s\n' "$DESKTOP_CATEGORIES"
         printf 'StartupNotify=true\n'
     } > "$DESKTOP_FILE"
@@ -834,6 +902,7 @@ if [[ "$INSTALL_DESKTOP" == true ]]; then
     chmod +x "$DESKTOP_FILE"
     echo "Installed desktop file: $DESKTOP_FILE"
     echo "Icon: $ICON"
+    echo "StartupWMClass: $STARTUP_WM_CLASS"
 
     refresh_desktop_database "$DESKTOP_DIR"
     exit 0
