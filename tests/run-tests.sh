@@ -170,9 +170,21 @@ EOF
 cat > "$BIN/waypipe" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$@" > "$FAKE_WAYPIPE_LOG"
+if [ -n "${FAKE_WAYPIPE_OUTPUT:-}" ] && [ -f "$FAKE_WAYPIPE_OUTPUT" ]; then
+    cat "$FAKE_WAYPIPE_OUTPUT" >&2
+fi
+if [ -n "${FAKE_WAYPIPE_STATUS:-}" ]; then
+    exit "$FAKE_WAYPIPE_STATUS"
+fi
 EOF
 
-chmod +x "$BIN/ssh" "$BIN/scp" "$BIN/waypipe"
+cat > "$BIN/zenity" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > "$FAKE_ZENITY_LOG"
+exit 0
+EOF
+
+chmod +x "$BIN/ssh" "$BIN/scp" "$BIN/waypipe" "$BIN/zenity"
 
 # ---------------------------------------------------------
 # Test environment helpers
@@ -192,6 +204,11 @@ run_app() {
         XDG_DATA_HOME="$LOCAL_HOME/.local/share" \
         FAKE_REMOTE_HOME="$REMOTE_HOME" \
         FAKE_WAYPIPE_LOG="$WORK/waypipe.args" \
+        FAKE_WAYPIPE_OUTPUT="${FAKE_WAYPIPE_OUTPUT:-}" \
+        FAKE_WAYPIPE_STATUS="${FAKE_WAYPIPE_STATUS:-0}" \
+        FAKE_ZENITY_LOG="$WORK/zenity.args" \
+        REMOTE_APP_PIPE_HANDOVER_TIMEOUT="${REMOTE_APP_PIPE_HANDOVER_TIMEOUT:-10}" \
+        WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-test}" \
         PATH="$BIN:/usr/local/bin:/usr/bin:/bin" \
         "$APP" "$@"
 }
@@ -226,6 +243,8 @@ test_help() {
     assert_eq 1 "$?" "help exits with usage status"
     assert_contains "$WORK/out" 'Usage:' "help shows usage"
     assert_contains "$WORK/out" '--refresh-icon' "help documents icon refresh"
+    assert_contains "$WORK/out" '--debug' "help documents debug mode"
+    assert_contains "$WORK/out" '--no-handover' "help documents handover opt-out"
 }
 
 test_validation() {
@@ -338,7 +357,7 @@ test_launch_resolves_absolute_remote_path() {
     reset_env
     install_remote_binary
 
-    run_app -t "$TARGET" -H "$SERVER_HOST" betterbird --foo 'bar baz' > "$WORK/out" 2>&1
+    run_app --debug -t "$TARGET" -H "$SERVER_HOST" betterbird --foo 'bar baz' > "$WORK/out" 2>&1
     assert_eq 0 "$?" "launch exits successfully"
 
     local log="$WORK/waypipe.args"
@@ -347,6 +366,11 @@ test_launch_resolves_absolute_remote_path() {
     assert_contains "$log" '--server' "server mode flag passed"
     assert_contains "$log" 'bar baz' "argument with spaces is preserved"
     assert_no_line "$log" 'remote-app-pipe' "bare remote-app-pipe name is not used"
+    assert_contains "$WORK/out" 'client mode: resolved remote executable' "debug shows the resolved remote executable"
+
+    local debug_count
+    debug_count="$(grep -Fxc -- '--debug' "$log")"
+    assert_eq 2 "$debug_count" "debug flag is passed to waypipe and the remote script"
 }
 
 test_launch_missing_remote_binary() {
@@ -393,6 +417,95 @@ test_custom_bin_dir_in_desktop_exec() {
     assert_contains "$desktop" '--bin-dir "~/custom-bin"' "Exec contains --bin-dir"
 }
 
+test_debug_and_generic_handover() {
+    begin_test "debug output and generic handover"
+    reset_env
+
+    # Start a safely named long-running process that the generic handover
+    # should find. Its WAYLAND_DISPLAY differs from the test client's.
+    mkdir -p "$WORK/handover-proc"
+    cp /bin/sleep "$WORK/handover-proc/rap-test-app"
+    chmod +x "$WORK/handover-proc/rap-test-app"
+    env WAYLAND_DISPLAY="wayland-victim-$$" "$WORK/handover-proc/rap-test-app" 60 &
+    local victim=$!
+
+    # This is what the script launches after the handover.
+    cat > "$BIN/rap-test-app" <<EOF
+#!/bin/sh
+printf '%s\n' "\$@" > "$WORK/rap-test-app.args"
+EOF
+    chmod +x "$BIN/rap-test-app"
+
+    run_app --server --debug rap-test-app > "$WORK/out" 2>&1
+    assert_eq 0 "$?" "server mode with --debug exits successfully"
+    assert_file "$WORK/rap-test-app.args" "app was executed after handover"
+    assert_contains "$WORK/out" 'handover: candidate pid' "handover found the running process"
+    assert_contains "$WORK/out" 'handover: sending SIGTERM' "handover sent SIGTERM"
+    assert_contains "$WORK/out" 'handover: pid' "handover reported pid details"
+    assert_contains "$WORK/out" 'stopped' "handover reported the process stopped"
+    assert_contains "$WORK/out" 'app exited with status 0' "debug reports the app exit status"
+
+    local victim_state
+    victim_state=$(ps -o stat= -p "$victim" 2>/dev/null | tr -d ' ' || true)
+    if [[ -z "$victim_state" || "$victim_state" == Z* ]]; then
+        ok "handover stopped the existing process"
+    else
+        not_ok "handover stopped the existing process"
+    fi
+    wait "$victim" 2>/dev/null || true
+}
+
+test_no_handover() {
+    begin_test "--no-handover is preserved in launchers and remote commands"
+    reset_env
+    install_remote_binary
+
+    run_app --install-desktop --no-fetch-icon --no-handover \
+        -t "$TARGET" -H "$SERVER_HOST" \
+        -a betterbird -i betterbird > "$WORK/out" 2>&1
+    assert_eq 0 "$?" "install with --no-handover exits successfully"
+
+    local desktop="$LOCAL_HOME/.local/share/applications/remote-betterbird-${TARGET}.desktop"
+    assert_contains "$desktop" '--no-handover' "launcher records --no-handover"
+
+    run_app --no-handover -t "$TARGET" -H "$SERVER_HOST" betterbird > "$WORK/out" 2>&1
+    assert_eq 0 "$?" "launch with --no-handover exits successfully"
+    assert_contains "$WORK/waypipe.args" '--no-handover' "remote command receives --no-handover"
+}
+
+test_handover_failure_remote() {
+    begin_test "remote handover failure is reported"
+    reset_env
+
+    # This process ignores SIGTERM and has a unique argv[0] that the generic
+    # handover can match.
+    ( trap '' TERM; export WAYLAND_DISPLAY="wayland-stubborn-$$-test"; exec -a rap-stubborn-app sleep 60 ) &
+    local victim=$!
+    sleep 0.2
+
+    REMOTE_APP_PIPE_HANDOVER_TIMEOUT=1 \
+        run_app --server rap-stubborn-app > "$WORK/out" 2>&1
+    assert_eq 75 "$?" "remote returns EX_TEMPFAIL on handover failure"
+    assert_contains "$WORK/out" 'could not stop these' "failure lists the remaining processes"
+    assert_contains "$WORK/out" 'REMOTE_APP_PIPE_HANDOVER_FAILED' "failure marker is emitted"
+
+    kill -KILL "$victim" 2>/dev/null || true
+    wait "$victim" 2>/dev/null || true
+}
+
+test_handover_failure_dialog() {
+    begin_test "handover failure shows a client dialog"
+    reset_env
+    install_remote_binary
+
+    printf 'REMOTE_APP_PIPE_HANDOVER_FAILED\n' > "$WORK/waypipe-output"
+    FAKE_WAYPIPE_OUTPUT="$WORK/waypipe-output" FAKE_WAYPIPE_STATUS=75 \
+        run_app -t "$TARGET" -H "$SERVER_HOST" betterbird > "$WORK/out" 2>&1
+    assert_eq 75 "$?" "client returns the waypipe status"
+    assert_file "$WORK/zenity.args" "dialog tool was invoked"
+    assert_contains "$WORK/zenity.args" 'Could not stop' "dialog explains the handover failure"
+}
+
 test_server_mode() {
     begin_test "server mode runs the app locally"
     reset_env
@@ -423,6 +536,10 @@ test_launch_resolves_absolute_remote_path
 test_launch_missing_remote_binary
 test_deploy_expands_remote_home
 test_custom_bin_dir_in_desktop_exec
+test_no_handover
+test_debug_and_generic_handover
+test_handover_failure_remote
+test_handover_failure_dialog
 test_server_mode
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

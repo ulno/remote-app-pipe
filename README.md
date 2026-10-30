@@ -8,7 +8,7 @@ It works over any SSH connection — a LAN, a private mesh such as Nebula, Tails
 
 ## Key Features
 
-* **Graceful Session Handover:** Detects when an app (e.g., Thunderbird) is already running on a physical or orphaned display, sends a `SIGTERM` to safely flush SQLite caches and remove `parent.lock`, and reclaims the session for the active Wayland context.
+* **Generic Session Handover:** Detects an existing instance of the launched executable and its descendant process tree, sends `SIGTERM`, waits for it to exit, and then starts a fresh instance in the active Wayland/Waypipe context. Shells, interpreters, and session tools are excluded for safety; `--no-handover` disables the behavior.
 * **Polymorphic Host Detection:** Compares the local node name (`uname -n`) against `--server-host` (`-H`). If executed on the target host, it runs locally without network overhead; otherwise, it establishes a Waypipe tunnel over SSH. `-H` defaults to the first DNS label of `-t`.
 * **Network-Optimized Waypipe:** Uses `zstd=3` compression over raw SSH to reduce latency across WAN, VPN, and mesh links without double-compression CPU overhead.
 * **Built-in Self-Deployment:** Pushes itself to any workstation's binary directory via `scp`.
@@ -84,6 +84,26 @@ remote-app-pipe -t work-alias -H work-workstation zed
 ```
 
 In `--server` mode, `-H` defaults to the local `uname -n`.
+
+---
+
+## Session Handover
+
+Before launching a remote app, `remote-app-pipe` looks for an existing instance owned by the same user. The match is generic:
+
+* the executable basename (`betterbird`, `firefox`, `zed`, ...),
+* the `${app}-bin` variant used by some Thunderbird/Betterbird builds,
+* the `/proc/<pid>/exe` basename,
+* the first command-line argument, and
+* all descendants of any matching process.
+
+If an existing instance is on a different `WAYLAND_DISPLAY`, it and its process tree are sent `SIGTERM`. The script waits up to 10 seconds for them to stop. If everything stops, the new instance is launched. If the app is already on the target Wayland display, it is left running.
+
+Shells (`sh`, `bash`, `zsh`, ...), interpreters (`python`, `node`, `java`, ...), and session tools (`ssh`, `sudo`, `tmux`, `waypipe`, ...) are never handed over. Use `--no-handover` to disable handover entirely for an app; `--install-desktop --no-handover` records that choice in the generated launcher.
+
+If `SIGTERM` is not enough, the remote script exits with status 75 and prints the PIDs, process names, and `WAYLAND_DISPLAY` values that are still alive. The client then shows a local error window through `zenity`, `kdialog`, `xmessage`, a terminal emulator, or `notify-send` — whichever is available — so it is visible even when the launcher has `Terminal=false`. If none is available, the details go to stderr.
+
+The handover timeout can be changed on the server with the `REMOTE_APP_PIPE_HANDOVER_TIMEOUT` environment variable (default: `10` seconds).
 
 ---
 
@@ -163,6 +183,9 @@ remote-app-pipe -t work-desktop firefox -P WorkRemote --no-remote
 
 # Open a remote file manager:
 remote-app-pipe -t home-desktop dolphin ~/Documents
+
+# Show local and remote handover/launch debugging information:
+remote-app-pipe --debug -t home-desktop thunderbird
 ```
 
 > Note: paths such as `~/projects` are expanded by your local shell before the command is sent. Use paths that exist on the remote host.
@@ -186,6 +209,8 @@ remote-app-pipe -t home-desktop dolphin ~/Documents
 | `--fetch-icon` | Flag | Always pull the app icon from the remote host. |
 | `--no-fetch-icon` | Flag | Never pull icons automatically. |
 | `--refresh-icon <file>` | Optional | Re-fetch the icon for an existing `.desktop` file. |
+| `-d`, `--debug` | Flag | Print local and remote debugging information. Also enables waypipe debug logging. |
+| `--no-handover` | Flag | Do not stop an existing instance before launching. Recorded in `--install-desktop` launchers. |
 
 ** `--target` is only optional when running directly on the server in `--server` mode.*
 
@@ -205,11 +230,29 @@ or:
 make test
 ```
 
-The tests cover desktop generation, icon fetching and refresh, deployment path handling, absolute remote binary resolution, argument quoting, server-mode execution, and validation errors.
+The tests cover desktop generation, icon fetching and refresh, deployment path handling, `-H` derivation, absolute remote binary resolution, argument quoting, debug output, generic process-tree handover, `--no-handover`, handover failure reporting/dialogs, server-mode execution, and validation errors.
 
 ---
 
 ## Troubleshooting
+
+### Nothing appears, or the command returns immediately
+
+Single-instance applications hand a new launch to an already-running process. If that process is on the server's physical display, the new window may appear there — or the launch may simply exit.
+
+`remote-app-pipe` handles this generically: it finds the launched executable, its `${app}-bin` variant, and descendants, then terminates them with `SIGTERM` if they are on a different Wayland display. If they do not stop within the timeout, the client shows an error dialog with the remaining PIDs and displays. To see exactly what happens remotely, add `--debug`:
+
+```bash
+remote-app-pipe --debug -t home-desktop betterbird
+```
+
+The debug flag is forwarded to the remote side (and enables waypipe's own debug output), so you can see the handover search, the detected `WAYLAND_DISPLAY`, and whether the old process was stopped. For very noisy output, redirect it:
+
+```bash
+remote-app-pipe --debug -t home-desktop betterbird 2>remote-app-pipe-debug.log
+```
+
+If the application is already on the same Waypipe display, handover deliberately leaves it running. If it is still running after `SIGTERM`, the debug output says so and the client dialog reports the remaining processes; close them manually or use `--no-handover` for that app.
 
 ### `Failed to run program "remote-app-pipe": No such file or directory`
 

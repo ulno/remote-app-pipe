@@ -13,6 +13,17 @@ APP_ARGS=()
 IS_SERVER=false
 INSTALL_DESKTOP=false
 DEPLOY_SELF=false
+DEBUG=false
+HANDOVER=true
+
+# Never treat these as applications to hand over: they are shells, interpreters,
+# session tools, or our own plumbing. Killing them would be destructive.
+HANDOVER_DENYLIST=" init systemd login ssh sshd scp sftp sudo su doas sh bash dash zsh fish ksh csh tcsh tmux screen env waypipe pgrep pkill kill ps top htop python python2 python3 node nodejs java perl ruby php lua electron "
+
+HANDOVER_TIMEOUT="${REMOTE_APP_PIPE_HANDOVER_TIMEOUT:-10}"
+case "$HANDOVER_TIMEOUT" in
+    ''|*[!0-9]*) HANDOVER_TIMEOUT=10 ;;
+esac
 # Keep the tilde literal: it is expanded against the remote $HOME, not the local one.
 REMOTE_BIN_DIR="~/.local/bin"
 
@@ -41,6 +52,8 @@ Modes:
                                  e.g. remote-host.mydomain.mesh -> remote-host)
     <app>                        Application binary to run (thunderbird, zed, firefox, etc.)
     --bin-dir <path>             Remote binary folder used to launch this script (default: ~/.local/bin)
+    -d, --debug                  Print local and remote debugging information
+    --no-handover                Do not stop an existing instance before launching
 
   Deployment:
     --deploy                     Copy this script to target host's bin folder via scp
@@ -75,6 +88,9 @@ Examples:
 
   # Repair/refresh an existing launcher's icon:
   remote-app-pipe --refresh-icon ~/.local/share/applications/remote-thunderbird-work-desktop.desktop
+
+  # Debug a launch, including remote handover decisions:
+  remote-app-pipe --debug -t work-desktop betterbird
 EOF
     exit 1
 }
@@ -82,6 +98,83 @@ EOF
 # ---------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------
+
+debug() {
+    if [[ "$DEBUG" == true ]]; then
+        printf 'remote-app-pipe[%s]: %s\n' "$$" "$*" >&2
+    fi
+}
+
+debug_command() {
+    local out=""
+    local arg
+    for arg in "$@"; do
+        out+="$(printf '%q' "$arg") "
+    done
+    debug "executing: ${out% }"
+}
+
+pid_alive() {
+    local pid="$1"
+    local state
+    [[ -r "/proc/$pid/status" ]] || return 1
+    state=$(awk '/^State:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null || true)
+    [[ -n "$state" && "$state" != "Z" ]]
+}
+
+proc_display() {
+    local pid="$1"
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^WAYLAND_DISPLAY=' | cut -d= -f2 | head -n 1 || true
+}
+
+# Show the remote handover failure on the client, where the user can see it.
+show_handover_error() {
+    local log="$1"
+    local text
+    local msg
+
+    text=$(tail -n 60 "$log" 2>/dev/null || true)
+    msg=$(printf 'Could not stop the existing application instance on the remote host.\n\n%s\n\nClose it manually on the server and try again.' "$text")
+
+    if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --error --title='remote-app-pipe' --text="$msg" 2>/dev/null || true
+            return 0
+        fi
+        if command -v kdialog >/dev/null 2>&1; then
+            kdialog --title 'remote-app-pipe' --error "$msg" 2>/dev/null || true
+            return 0
+        fi
+        if command -v xmessage >/dev/null 2>&1; then
+            xmessage -center -title 'remote-app-pipe' "$msg" 2>/dev/null || true
+            return 0
+        fi
+
+        # Fall back to a terminal with the full text, for minimal desktops.
+        local msgfile term
+        msgfile=$(mktemp "${TMPDIR:-/tmp}/remote-app-pipe-error.XXXXXX.txt")
+        printf '%s\n' "$msg" > "$msgfile"
+        for term in x-terminal-emulator konsole gnome-terminal xfce4-terminal mate-terminal alacritty xterm; do
+            command -v "$term" >/dev/null 2>&1 || continue
+            case "$term" in
+                gnome-terminal|mate-terminal)
+                    "$term" -- sh -c 'cat "$1"; printf "\nPress Enter to close..."; read -r _' sh "$msgfile" >/dev/null 2>&1 && return 0
+                    ;;
+                *)
+                    "$term" -e sh -c 'cat "$1"; printf "\nPress Enter to close..."; read -r _' sh "$msgfile" >/dev/null 2>&1 && return 0
+                    ;;
+            esac
+        done
+        rm -f "$msgfile"
+
+        if command -v notify-send >/dev/null 2>&1; then
+            notify-send 'remote-app-pipe' "$msg" 2>/dev/null || true
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "$msg" >&2
+}
 
 # Expand a leading ~ with a home directory that was determined remotely.
 expand_remote_path() {
@@ -520,6 +613,18 @@ while [[ $# -gt 0 ]]; do
             IS_SERVER=true
             shift
             ;;
+        -d|--debug)
+            DEBUG=true
+            shift
+            ;;
+        --no-handover)
+            HANDOVER=false
+            shift
+            ;;
+        --handover)
+            HANDOVER=true
+            shift
+            ;;
         --install-desktop)
             INSTALL_DESKTOP=true
             shift
@@ -644,6 +749,8 @@ if [[ -z "$SERVER_HOSTNAME" ]]; then
     usage
 fi
 
+debug "target='${TARGET_HOST}' server_host='${SERVER_HOSTNAME}' app='${APP}'"
+
 if [[ -z "$APP" ]]; then
     echo "Error: No application specified." >&2
     usage
@@ -700,6 +807,9 @@ if [[ "$INSTALL_DESKTOP" == true ]]; then
     if [[ "$REMOTE_BIN_DIR" != "~/.local/bin" ]]; then
         EXEC_LINE+=" --bin-dir $(desktop_exec_arg "$REMOTE_BIN_DIR")"
     fi
+    if [[ "$HANDOVER" == false ]]; then
+        EXEC_LINE+=" --no-handover"
+    fi
     EXEC_LINE+=" $(desktop_exec_arg "$APP") %U"
 
     {
@@ -730,52 +840,206 @@ CURRENT_HOST="$(uname -n)"
 if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_HOST" == "$SERVER_HOSTNAME" ]]; then
 
     handover_instance() {
-        local proc_name="$1"
-        local pid
-        pid=$(pgrep -x "$proc_name" || true)
+        local app="$1"
+        local cur_disp="${WAYLAND_DISPLAY:-wayland-0}"
 
-        if [[ -n "$pid" ]]; then
-            local cur_disp="${WAYLAND_DISPLAY:-wayland-0}"
-            local proc_disp
-            proc_disp=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^WAYLAND_DISPLAY=' | cut -d= -f2 || true)
-
-            if [[ "$proc_disp" == "$cur_disp" && -n "$proc_disp" ]]; then
+        case " ${HANDOVER_DENYLIST} " in
+            *" ${app} "*)
+                debug "handover: '${app}' is on the denylist; skipping"
                 return 0
+                ;;
+        esac
+
+        local -A ppid_of=()
+        local -A comm_of=()
+        local -A uid_of=()
+        local -A children=()
+        local pid ppid uid comm
+
+        while read -r pid ppid uid comm; do
+            [[ -n "$pid" ]] || continue
+            ppid_of[$pid]=$ppid
+            comm_of[$pid]=$comm
+            uid_of[$pid]=$uid
+        done < <(ps -e -o pid=,ppid=,uid=,comm= 2>/dev/null)
+
+        if [[ ${#ppid_of[@]} -eq 0 ]]; then
+            debug "handover: could not read the process table; skipping"
+            return 0
+        fi
+
+        # Never signal this script, its ancestors, or PID 1.
+        local -A protected=()
+        local p=$$
+        while [[ -n "$p" && "$p" -gt 1 ]]; do
+            protected[$p]=1
+            p=${ppid_of[$p]:-}
+        done
+        protected[1]=1
+
+        for pid in "${!ppid_of[@]}"; do
+            ppid=${ppid_of[$pid]}
+            children[$ppid]+=" $pid"
+        done
+
+        local -a roots=()
+        local exe argv0 c
+        for pid in "${!comm_of[@]}"; do
+            [[ "${uid_of[$pid]:-}" == "$EUID" ]] || continue
+            [[ -n "${protected[$pid]:-}" ]] && continue
+
+            c=${comm_of[$pid]}
+            if [[ "$c" == "$app" || "$c" == "${app}-bin" ]]; then
+                roots+=("$pid")
+                continue
             fi
 
-            kill -TERM "$pid" 2>/dev/null || true
+            exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+            if [[ "${exe##*/}" == "$app" || "${exe##*/}" == "${app}-bin" ]]; then
+                roots+=("$pid")
+                continue
+            fi
 
-            for _ in {1..30}; do
-                if ! kill -0 "$pid" 2>/dev/null; then
+            if [[ -r "/proc/$pid/cmdline" ]]; then
+                argv0=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1 || true)
+                if [[ "${argv0##*/}" == "$app" ]]; then
+                    roots+=("$pid")
+                fi
+            fi
+        done
+
+        if [[ ${#roots[@]} -eq 0 ]]; then
+            debug "handover: no running '${app}' process found"
+            return 0
+        fi
+
+        debug "handover: found ${#roots[@]} matching root process(es)"
+
+        local root disp
+        for root in "${roots[@]}"; do
+            disp=$(proc_display "$root" || true)
+            debug "handover: candidate pid ${root} (${comm_of[$root]}) WAYLAND_DISPLAY='${disp:-<unset>}'"
+            if [[ -n "$disp" && "$disp" == "$cur_disp" ]]; then
+                debug "handover: '${app}' is already on the target display; leaving it running"
+                return 0
+            fi
+        done
+
+        # Include the whole descendant tree of every matching root.
+        local -a queue=("${roots[@]}")
+        local -A seen=()
+        local -a kill_pids=()
+        local child
+        while [[ ${#queue[@]} -gt 0 ]]; do
+            p=${queue[0]}
+            queue=("${queue[@]:1}")
+            [[ -n "${seen[$p]:-}" ]] && continue
+            seen[$p]=1
+            [[ -n "${protected[$p]:-}" ]] && continue
+            [[ "${uid_of[$p]:-}" == "$EUID" ]] || continue
+            kill_pids+=("$p")
+            for child in ${children[$p]:-}; do
+                queue+=("$child")
+            done
+        done
+
+        if [[ ${#kill_pids[@]} -eq 0 ]]; then
+            debug "handover: all matching processes are protected; skipping"
+            return 0
+        fi
+
+        debug "handover: sending SIGTERM to pids [${kill_pids[*]}]"
+        for pid in "${kill_pids[@]}"; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+
+        local attempts=$((HANDOVER_TIMEOUT * 5))
+        local i alive
+        for ((i = 0; i < attempts; i++)); do
+            alive=0
+            for pid in "${kill_pids[@]}"; do
+                if pid_alive "$pid"; then
+                    alive=1
                     break
                 fi
-                sleep 0.2
             done
-            sleep 0.3
+            [[ "$alive" -eq 0 ]] && break
+            sleep 0.2
+        done
+        sleep 0.3
+
+        local failed=0
+        for pid in "${kill_pids[@]}"; do
+            if pid_alive "$pid"; then
+                failed=1
+                debug "handover: pid ${pid} (${comm_of[$pid]:-?}) is still running"
+            else
+                debug "handover: pid ${pid} stopped"
+            fi
+        done
+
+        if [[ "$failed" -ne 0 ]]; then
+            echo "remote-app-pipe: could not stop these '${app}' process(es) with SIGTERM:" >&2
+            for pid in "${kill_pids[@]}"; do
+                if pid_alive "$pid"; then
+                    echo "  PID ${pid} (${comm_of[$pid]:-?}) WAYLAND_DISPLAY='$(proc_display "$pid")'" >&2
+                fi
+            done
+            return 1
         fi
+
+        return 0
     }
 
-    case "$APP" in
-        thunderbird)
-            handover_instance thunderbird
-            exec thunderbird "${APP_ARGS[@]}"
-            ;;
+    debug "server mode: host='${CURRENT_HOST}' app='${APP}' args='${APP_ARGS[*]:-}'"
 
+    run_or_exec() {
+        if [[ "$DEBUG" == true ]]; then
+            local status=0
+            "$@" || status=$?
+            debug "app exited with status ${status}"
+            exit "$status"
+        fi
+        exec "$@"
+    }
+
+    APP_NAME="${APP##*/}"
+
+    if [[ "$HANDOVER" == true ]]; then
+        if [[ "$APP_NAME" == "firefox" ]]; then
+            if [[ "${APP_ARGS[*]:-}" == *"-P"* || "${APP_ARGS[*]:-}" == *"--profile"* ]]; then
+                debug "handover: isolated Firefox profile requested; skipping"
+            elif ! handover_instance "$APP_NAME"; then
+                echo "remote-app-pipe: failed to stop the existing '${APP_NAME}' instance on ${CURRENT_HOST}." >&2
+                echo "REMOTE_APP_PIPE_HANDOVER_FAILED" >&2
+                echo "Close it manually and try again." >&2
+                exit 75
+            fi
+        elif ! handover_instance "$APP_NAME"; then
+            echo "remote-app-pipe: failed to stop the existing '${APP_NAME}' instance on ${CURRENT_HOST}." >&2
+            echo "REMOTE_APP_PIPE_HANDOVER_FAILED" >&2
+            echo "Close it manually and try again." >&2
+            exit 75
+        fi
+    else
+        debug "handover: disabled with --no-handover"
+    fi
+
+    case "$APP_NAME" in
         firefox)
             if [[ "${APP_ARGS[*]:-}" == *"-P"* || "${APP_ARGS[*]:-}" == *"--profile"* ]]; then
-                exec firefox --no-remote "${APP_ARGS[@]}"
+                run_or_exec "$APP" --no-remote "${APP_ARGS[@]}"
             else
-                handover_instance firefox
-                exec firefox "${APP_ARGS[@]}"
+                run_or_exec "$APP" "${APP_ARGS[@]}"
             fi
             ;;
 
         zed|zeditor)
-            exec zed "${APP_ARGS[@]}"
+            run_or_exec zed "${APP_ARGS[@]}"
             ;;
 
         *)
-            exec "$APP" "${APP_ARGS[@]}"
+            run_or_exec "$APP" "${APP_ARGS[@]}"
             ;;
     esac
 
@@ -794,6 +1058,36 @@ else
         exit 1
     fi
 
-    exec waypipe --compress zstd=3 ssh -o ExitOnForwardFailure=yes "$TARGET_HOST" \
-        "$REMOTE_EXE" --server -H "$SERVER_HOSTNAME" "$APP" "${APP_ARGS[@]}"
+    debug "client mode: resolved remote executable '${REMOTE_EXE}'"
+
+    waypipe_cmd=(waypipe)
+    if [[ "$DEBUG" == true ]]; then
+        waypipe_cmd+=(--debug)
+    fi
+    waypipe_cmd+=(--compress zstd=3 ssh -o ExitOnForwardFailure=yes "$TARGET_HOST" "$REMOTE_EXE" --server)
+    if [[ "$DEBUG" == true ]]; then
+        waypipe_cmd+=(--debug)
+    fi
+    if [[ "$HANDOVER" == false ]]; then
+        waypipe_cmd+=(--no-handover)
+    fi
+    waypipe_cmd+=(-H "$SERVER_HOSTNAME" "$APP" "${APP_ARGS[@]}")
+
+    debug_command "${waypipe_cmd[@]}"
+
+    # Capture the remote output so a failed handover can still be shown when
+    # the launcher was started without a terminal (Terminal=false).
+    log_file="$(mktemp "${TMPDIR:-/tmp}/remote-app-pipe.XXXXXX.log")"
+    status=0
+    set +e
+    "${waypipe_cmd[@]}" 2>&1 | tee "$log_file" >&2
+    status=${PIPESTATUS[0]}
+    set -e
+
+    if grep -q 'REMOTE_APP_PIPE_HANDOVER_FAILED' "$log_file" 2>/dev/null; then
+        show_handover_error "$log_file"
+    fi
+
+    rm -f "$log_file"
+    exit "$status"
 fi
