@@ -80,7 +80,7 @@ The target can be any SSH destination: a hostname, an SSH alias, an IP address, 
 Override `-H` when your SSH alias or IP does not match the machine's hostname:
 
 ```bash
-remote-app-pipe -t work-alias -H work-workstation zed
+remote-app-pipe -t work-alias -H work-workstation zeditor
 ```
 
 In `--server` mode, `-H` defaults to the local `uname -n`.
@@ -135,7 +135,7 @@ This short form uses the app name positionally, fetches the remote icon automati
 
 Before launching a remote app, `remote-app-pipe` looks for an existing instance owned by the same user. The match is generic:
 
-* the executable basename (`betterbird`, `firefox`, `zed`, ...),
+* the executable basename (`betterbird`, `firefox`, `zeditor`, ...),
 * the `${app}-bin` variant used by some Thunderbird/Betterbird builds,
 * the `/proc/<pid>/exe` basename,
 * the first command-line argument, and
@@ -216,12 +216,14 @@ Run an editor remotely while keeping GPU-accelerated local rendering:
 ```bash
 remote-app-pipe --install-desktop \
   -t work-desktop \
-  -a zed \
+  -a zeditor \
   -n "Zed (Work)" \
   -i zed \
   -c "Editor running on the work workstation" \
   --categories "Development;IDE;"
 ```
+
+On many distributions the Zed CLI binary is `zeditor`; the script also accepts `zed` and falls back between the two names.
 
 ### 3. Work-Only Browser
 
@@ -247,7 +249,7 @@ These are the ad-hoc commands used in step 1 of the default workflow. They accep
 
 ```bash
 # Open a remote project folder in Zed on the home desktop:
-remote-app-pipe -t home-desktop zed ~/projects/research
+remote-app-pipe -t home-desktop zeditor ~/projects/research
 
 # Open a work-restricted URL through the work workstation:
 remote-app-pipe -t work-desktop firefox https://intranet.example.com
@@ -272,7 +274,7 @@ remote-app-pipe --debug -t home-desktop thunderbird
 | --- | --- | --- |
 | `-t`, `--target` | Required* | SSH hostname, alias, IP, or mesh/VPN name of the target machine. |
 | `-H`, `--server-host` | Optional | Physical hostname of the server (as reported by `uname -n`). Default: derived from `-t` by taking its first DNS label. |
-| `<app>` / `-a` | Required | Binary executable name to invoke (`thunderbird`, `zed`, etc.). |
+| `<app>` / `-a` | Required | Binary executable name to invoke (`thunderbird`, `zeditor`, etc.). |
 | `--deploy` | Flag | Copies `remote-app-pipe` to the target host via `scp`. |
 | `--bin-dir <path>` | Optional | Remote directory for `--deploy` and for locating the remote binary at launch (Default: `~/.local/bin`). A leading `~` is expanded against the remote `$HOME`. |
 | `--install-desktop` | Flag | Creates and registers an XDG `.desktop` launcher. |

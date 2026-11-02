@@ -434,6 +434,36 @@ test_startup_wm_class_override() {
     assert_contains "$desktop" 'StartupWMClass=org.example.Betterbird' "override is written to the launcher"
 }
 
+test_server_command_resolution() {
+    begin_test "server command resolution"
+    reset_env
+
+    cat > "$BIN/zeditor" <<EOF
+#!/bin/sh
+printf '%s\n' "\$@" > "$WORK/zeditor.args"
+EOF
+    chmod +x "$BIN/zeditor"
+
+    run_app --server --no-handover --debug zeditor 'arg one' > "$WORK/out" 2>&1
+    assert_eq 0 "$?" "zeditor is found and runs"
+    assert_file "$WORK/zeditor.args" "zeditor was executed"
+    assert_contains "$WORK/zeditor.args" 'arg one' "zeditor argument passed"
+    assert_contains "$WORK/out" 'app exited with status 0' "debug reports zeditor exit status"
+
+    run_app --server --no-handover --debug zed 'arg two' > "$WORK/out" 2>&1
+    assert_eq 0 "$?" "zed falls back to zeditor"
+    assert_contains "$WORK/zeditor.args" 'arg two' "fallback zeditor received the argument"
+}
+
+test_server_missing_app() {
+    begin_test "missing remote application"
+    reset_env
+
+    run_app --server --no-handover missing-app-xyz > "$WORK/out" 2>&1
+    assert_eq 127 "$?" "missing app returns command-not-found status"
+    assert_contains "$WORK/out" 'application not found' "missing app error is clear"
+}
+
 test_debug_and_generic_handover() {
     begin_test "debug output and generic handover"
     reset_env
@@ -555,6 +585,8 @@ test_deploy_expands_remote_home
 test_custom_bin_dir_in_desktop_exec
 test_startup_wm_class_override
 test_no_handover
+test_server_command_resolution
+test_server_missing_app
 test_debug_and_generic_handover
 test_handover_failure_remote
 test_handover_failure_dialog

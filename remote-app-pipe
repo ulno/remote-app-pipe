@@ -51,7 +51,7 @@ Modes:
     -t, --target <host>          SSH host or alias of the target machine (REQUIRED)
     -H, --server-host <hostname> Physical hostname of the server (optional; default: derived from -t,
                                  e.g. remote-host.mydomain.mesh -> remote-host)
-    <app>                        Application binary to run (thunderbird, zed, firefox, etc.)
+    <app>                        Application binary to run (thunderbird, zeditor, firefox, etc.)
     --bin-dir <path>             Remote binary folder used to launch this script (default: ~/.local/bin)
     -d, --debug                  Print local and remote debugging information
     --no-handover                Do not stop an existing instance before launching
@@ -1070,13 +1070,50 @@ if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_
     debug "server mode: host='${CURRENT_HOST}' app='${APP}' args='${APP_ARGS[*]:-}'"
 
     run_or_exec() {
+        local program="$1"
+        shift
+        local resolved
+        if ! resolved="$(resolve_remote_command "$program")"; then
+            echo "remote-app-pipe: application not found on ${CURRENT_HOST}: ${program}" >&2
+            echo "Check the binary name, or make sure its directory is in the remote PATH." >&2
+            exit 127
+        fi
+
         if [[ "$DEBUG" == true ]]; then
             local status=0
-            "$@" || status=$?
+            "$resolved" "$@" || status=$?
             debug "app exited with status ${status}"
             exit "$status"
         fi
-        exec "$@"
+        exec "$resolved" "$@"
+    }
+
+    resolve_remote_command() {
+        local command_name="$1"
+        local found dir
+
+        if [[ "$command_name" == /* ]]; then
+            if [[ -x "$command_name" ]]; then
+                printf '%s\n' "$command_name"
+                return 0
+            fi
+            return 1
+        fi
+
+        if found=$(command -v "$command_name" 2>/dev/null); then
+            printf '%s\n' "$found"
+            return 0
+        fi
+
+        # Non-interactive SSH often omits user bin directories from PATH.
+        for dir in "$HOME/.local/bin" "$HOME/bin" /usr/local/bin /usr/bin /bin; do
+            if [[ -x "$dir/$command_name" ]]; then
+                printf '%s\n' "$dir/$command_name"
+                return 0
+            fi
+        done
+
+        return 1
     }
 
     APP_NAME="${APP##*/}"
@@ -1111,7 +1148,18 @@ if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_
             ;;
 
         zed|zeditor)
-            run_or_exec zed "${APP_ARGS[@]}"
+            zed_bin=""
+            for candidate in "$APP" zeditor zed; do
+                if zed_bin="$(resolve_remote_command "$candidate")"; then
+                    break
+                fi
+                zed_bin=""
+            done
+            if [[ -z "$zed_bin" ]]; then
+                echo "remote-app-pipe: none of '${APP}', 'zeditor', or 'zed' was found on ${CURRENT_HOST}." >&2
+                exit 127
+            fi
+            run_or_exec "$zed_bin" "${APP_ARGS[@]}"
             ;;
 
         *)
