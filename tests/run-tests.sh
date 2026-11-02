@@ -444,6 +444,16 @@ printf '%s\n' "\$@" > "$WORK/zeditor.args"
 EOF
     chmod +x "$BIN/zeditor"
 
+    # Simulate an app whose desktop-entry name differs from its binary.
+    mkdir -p "$LOCAL_HOME/.local/share/applications"
+    cat > "$LOCAL_HOME/.local/share/applications/dev.zed.Zed.desktop" <<'EOF'
+[Desktop Entry]
+Name=Zed
+Exec=zeditor %U
+TryExec=zeditor
+Type=Application
+EOF
+
     run_app --server --no-handover --debug zeditor 'arg one' > "$WORK/out" 2>&1
     assert_eq 0 "$?" "zeditor is found and runs"
     assert_file "$WORK/zeditor.args" "zeditor was executed"
@@ -524,8 +534,14 @@ test_handover_failure_remote() {
     begin_test "remote handover failure is reported"
     reset_env
 
-    # This process ignores SIGTERM and has a unique argv[0] that the generic
-    # handover can match.
+    # The app must resolve, but the running process ignores SIGTERM and has a
+    # unique argv[0] that the generic handover can match.
+    cat > "$BIN/rap-stubborn-app" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod +x "$BIN/rap-stubborn-app"
+
     ( trap '' TERM; export WAYLAND_DISPLAY="wayland-stubborn-$$-test"; exec -a rap-stubborn-app sleep 60 ) &
     local victim=$!
     sleep 0.2

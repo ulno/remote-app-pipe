@@ -131,6 +131,26 @@ This short form uses the app name positionally, fetches the remote icon automati
 
 ---
 
+## Application Resolution
+
+The remote side resolves the requested app in this order:
+
+1. an absolute path, if given;
+2. the remote `PATH`;
+3. common binary directories: `~/.local/bin`, `~/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`;
+4. the remote `.desktop` entries, matching:
+   * the desktop-file id (`<app>.desktop`),
+   * `Exec=` / `TryExec=` executable names,
+   * `StartupWMClass=`,
+   * `Icon=`, or
+   * `Name=` as a final fallback.
+
+The `Exec=` line is used with field codes such as `%U` and `%f` removed, and wrapper commands such as `env` or `flatpak` are preserved. This means an alias like `zed` can resolve through `dev.zed.Zed.desktop` to the actual `zeditor` binary. The resolved executable name is also used for process handover, so `zed` and `zeditor` match the same running instance.
+
+Use `--debug` to see which desktop entry and command were chosen.
+
+---
+
 ## Session Handover
 
 Before launching a remote app, `remote-app-pipe` looks for an existing instance owned by the same user. The match is generic:
@@ -223,7 +243,7 @@ remote-app-pipe --install-desktop \
   --categories "Development;IDE;"
 ```
 
-On many distributions the Zed CLI binary is `zeditor`; the script also accepts `zed` and falls back between the two names.
+On many distributions the Zed CLI binary is `zeditor`. If you pass `zed`, the generic desktop-entry resolution finds `dev.zed.Zed.desktop` and runs its `Exec=` command (`zeditor`). The same works for other aliases, `-bin` variants, and applications launched through wrappers.
 
 ### 3. Work-Only Browser
 
@@ -274,7 +294,7 @@ remote-app-pipe --debug -t home-desktop thunderbird
 | --- | --- | --- |
 | `-t`, `--target` | Required* | SSH hostname, alias, IP, or mesh/VPN name of the target machine. |
 | `-H`, `--server-host` | Optional | Physical hostname of the server (as reported by `uname -n`). Default: derived from `-t` by taking its first DNS label. |
-| `<app>` / `-a` | Required | Binary executable name to invoke (`thunderbird`, `zeditor`, etc.). |
+| `<app>` / `-a` | Required | Binary or desktop-entry alias to invoke (`thunderbird`, `zeditor`, etc.). Resolved via `PATH` and then the remote `.desktop` entries. |
 | `--deploy` | Flag | Copies `remote-app-pipe` to the target host via `scp`. |
 | `--bin-dir <path>` | Optional | Remote directory for `--deploy` and for locating the remote binary at launch (Default: `~/.local/bin`). A leading `~` is expanded against the remote `$HOME`. |
 | `--install-desktop` | Flag | Creates and registers an XDG `.desktop` launcher. |
@@ -307,7 +327,7 @@ or:
 make test
 ```
 
-The tests cover desktop generation, icon fetching and refresh, `StartupWMClass` derivation/override, deployment path handling, `-H` derivation, absolute remote binary resolution, argument quoting, debug output, generic process-tree handover, `--no-handover`, handover failure reporting/dialogs, server-mode execution, and validation errors.
+The tests cover desktop generation, icon fetching and refresh, `StartupWMClass` derivation/override, deployment path handling, `-H` derivation, absolute remote binary resolution, desktop-entry-aware app resolution, argument quoting, debug output, generic process-tree handover, `--no-handover`, handover failure reporting/dialogs, server-mode execution, and validation errors.
 
 ---
 

@@ -18,7 +18,7 @@ HANDOVER=true
 
 # Never treat these as applications to hand over: they are shells, interpreters,
 # session tools, or our own plumbing. Killing them would be destructive.
-HANDOVER_DENYLIST=" init systemd login ssh sshd scp sftp sudo su doas sh bash dash zsh fish ksh csh tcsh tmux screen env waypipe pgrep pkill kill ps top htop python python2 python3 node nodejs java perl ruby php lua electron "
+HANDOVER_DENYLIST=" init systemd login ssh sshd scp sftp sudo su doas sh bash dash zsh fish ksh csh tcsh tmux screen env waypipe pgrep pkill kill ps top htop python python2 python3 node nodejs java perl ruby php lua electron flatpak snap distrobox toolbox "
 
 HANDOVER_TIMEOUT="${REMOTE_APP_PIPE_HANDOVER_TIMEOUT:-10}"
 case "$HANDOVER_TIMEOUT" in
@@ -1069,25 +1069,6 @@ if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_
 
     debug "server mode: host='${CURRENT_HOST}' app='${APP}' args='${APP_ARGS[*]:-}'"
 
-    run_or_exec() {
-        local program="$1"
-        shift
-        local resolved
-        if ! resolved="$(resolve_remote_command "$program")"; then
-            echo "remote-app-pipe: application not found on ${CURRENT_HOST}: ${program}" >&2
-            echo "Check the binary name, or make sure its directory is in the remote PATH." >&2
-            exit 127
-        fi
-
-        if [[ "$DEBUG" == true ]]; then
-            local status=0
-            "$resolved" "$@" || status=$?
-            debug "app exited with status ${status}"
-            exit "$status"
-        fi
-        exec "$resolved" "$@"
-    }
-
     resolve_remote_command() {
         local command_name="$1"
         local found dir
@@ -1116,20 +1097,205 @@ if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_
         return 1
     }
 
+    desktop_file_has_exec_token() {
+        local file="$1"
+        local app="$2"
+
+        awk -v app="$app" '
+            /^Exec=/ || /^TryExec=/ {
+                line = $0
+                sub(/^[^=]*=/, "", line)
+                n = split(line, parts, /[ \t]+/)
+                for (i = 1; i <= n; i++) {
+                    t = parts[i]
+                    gsub(/^"|"$/, "", t)
+                    sub(/^.*\//, "", t)
+                    if (t == app) found = 1
+                }
+            }
+            END { exit(found ? 0 : 1) }
+        ' "$file"
+    }
+
+    desktop_file_strong_match() {
+        local file="$1"
+        local app="$2"
+        local value
+
+        value=$(sed -n 's/^StartupWMClass=//p' "$file" | head -n 1)
+        [[ "$value" == "$app" ]] && return 0
+
+        value=$(sed -n 's/^Icon=//p' "$file" | head -n 1)
+        if [[ -n "$value" ]]; then
+            [[ "$value" == "$app" ]] && return 0
+            value="${value##*/}"
+            [[ "$value" == "$app" || "${value%.*}" == "$app" ]] && return 0
+        fi
+
+        desktop_file_has_exec_token "$file" "$app"
+    }
+
+    desktop_file_name_match() {
+        local file="$1"
+        local app="$2"
+        local name app_lc name_lc
+
+        name=$(sed -n 's/^Name=//p' "$file" | head -n 1)
+        [[ -n "$name" ]] || return 1
+        app_lc=$(printf '%s' "$app" | tr '[:upper:]' '[:lower:]')
+        name_lc=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+        [[ "$name_lc" == "$app_lc" || "$name_lc" == *"$app_lc"* ]]
+    }
+
+    find_remote_desktop_file() {
+        local app="$1"
+        local -a dirs=(
+            "$HOME/.local/share/applications"
+            "$HOME/.local/share/flatpak/exports/share/applications"
+            "/var/lib/flatpak/exports/share/applications"
+            "/var/lib/snapd/desktop/applications"
+            "/usr/local/share/applications"
+            "/usr/share/applications"
+        )
+        local dir file
+
+        # Exact desktop-file id first.
+        for dir in "${dirs[@]}"; do
+            [[ -d "$dir" ]] || continue
+            if [[ -f "$dir/$app.desktop" ]]; then
+                printf '%s\n' "$dir/$app.desktop"
+                return 0
+            fi
+        done
+
+        # Then match Exec/TryExec, StartupWMClass, or Icon.
+        for dir in "${dirs[@]}"; do
+            [[ -d "$dir" ]] || continue
+            for file in "$dir"/*.desktop; do
+                [[ -f "$file" ]] || continue
+                if desktop_file_strong_match "$file" "$app"; then
+                    printf '%s\n' "$file"
+                    return 0
+                fi
+            done
+        done
+
+        # Finally, accept a name match (for aliases such as zed -> Zed).
+        for dir in "${dirs[@]}"; do
+            [[ -d "$dir" ]] || continue
+            for file in "$dir"/*.desktop; do
+                [[ -f "$file" ]] || continue
+                if desktop_file_name_match "$file" "$app"; then
+                    printf '%s\n' "$file"
+                    return 0
+                fi
+            done
+        done
+
+        return 1
+    }
+
+    resolve_remote_app() {
+        local app="$1"
+        local found desktop exec_line try_exec token code
+        RESOLVED_CMD=()
+
+        if found=$(resolve_remote_command "$app"); then
+            RESOLVED_CMD=("$found")
+            return 0
+        fi
+
+        if ! desktop=$(find_remote_desktop_file "$app"); then
+            return 1
+        fi
+        debug "app resolution: '${app}' matched desktop entry ${desktop}"
+
+        exec_line=$(sed -n 's/^Exec=//p' "$desktop" | head -n 1)
+        try_exec=$(sed -n 's/^TryExec=//p' "$desktop" | head -n 1)
+
+        local -a tokens=()
+        if [[ -n "$exec_line" ]]; then
+            mapfile -t tokens < <(tokenize_exec "$exec_line")
+            for token in "${tokens[@]}"; do
+                token="${token//%%/%}"
+                for code in f F u U d D n N i c k v m; do
+                    token="${token//%$code/}"
+                done
+                [[ -n "$token" ]] && RESOLVED_CMD+=("$token")
+            done
+        fi
+
+        if [[ ${#RESOLVED_CMD[@]} -eq 0 && -n "$try_exec" ]]; then
+            RESOLVED_CMD=("$try_exec")
+        fi
+
+        if [[ ${#RESOLVED_CMD[@]} -eq 0 ]]; then
+            return 1
+        fi
+
+        if ! found=$(resolve_remote_command "${RESOLVED_CMD[0]}"); then
+            debug "app resolution: '${RESOLVED_CMD[0]}' from ${desktop} is not runnable"
+            RESOLVED_CMD=()
+            return 1
+        fi
+        RESOLVED_CMD[0]="$found"
+        return 0
+    }
+
+    run_or_exec() {
+        local program="$1"
+        shift
+
+        if ! resolve_remote_app "$program"; then
+            echo "remote-app-pipe: application not found on ${CURRENT_HOST}: ${program}" >&2
+            echo "No executable or matching .desktop entry was found." >&2
+            exit 127
+        fi
+
+        debug "app resolution: '${program}' -> ${RESOLVED_CMD[*]}"
+
+        if [[ "$DEBUG" == true ]]; then
+            local status=0
+            "${RESOLVED_CMD[@]}" "$@" || status=$?
+            debug "app exited with status ${status}"
+            exit "$status"
+        fi
+        exec "${RESOLVED_CMD[@]}" "$@"
+    }
+
+    debug "server mode: host='${CURRENT_HOST}' app='${APP}' args='${APP_ARGS[*]:-}'"
+
     APP_NAME="${APP##*/}"
+
+    # Resolve the app before handover so aliases such as zed -> zeditor use
+    # the real process name for matching, and so a missing binary fails
+    # before touching an existing instance.
+    if ! resolve_remote_app "$APP"; then
+        echo "remote-app-pipe: application not found on ${CURRENT_HOST}: ${APP}" >&2
+        echo "No executable or matching .desktop entry was found." >&2
+        exit 127
+    fi
+
+    RESOLVED_APP_NAME="${RESOLVED_CMD[0]##*/}"
+    HANDOVER_NAME="$APP_NAME"
+    case " $HANDOVER_DENYLIST " in
+        *" $RESOLVED_APP_NAME "*) ;;
+        *) HANDOVER_NAME="$RESOLVED_APP_NAME" ;;
+    esac
+    debug "app resolution: handover name='${HANDOVER_NAME}'"
 
     if [[ "$HANDOVER" == true ]]; then
         if [[ "$APP_NAME" == "firefox" ]]; then
             if [[ "${APP_ARGS[*]:-}" == *"-P"* || "${APP_ARGS[*]:-}" == *"--profile"* ]]; then
                 debug "handover: isolated Firefox profile requested; skipping"
-            elif ! handover_instance "$APP_NAME"; then
-                echo "remote-app-pipe: failed to stop the existing '${APP_NAME}' instance on ${CURRENT_HOST}." >&2
+            elif ! handover_instance "$HANDOVER_NAME"; then
+                echo "remote-app-pipe: failed to stop the existing '${HANDOVER_NAME}' instance on ${CURRENT_HOST}." >&2
                 echo "REMOTE_APP_PIPE_HANDOVER_FAILED" >&2
                 echo "Close it manually and try again." >&2
                 exit 75
             fi
-        elif ! handover_instance "$APP_NAME"; then
-            echo "remote-app-pipe: failed to stop the existing '${APP_NAME}' instance on ${CURRENT_HOST}." >&2
+        elif ! handover_instance "$HANDOVER_NAME"; then
+            echo "remote-app-pipe: failed to stop the existing '${HANDOVER_NAME}' instance on ${CURRENT_HOST}." >&2
             echo "REMOTE_APP_PIPE_HANDOVER_FAILED" >&2
             echo "Close it manually and try again." >&2
             exit 75
@@ -1145,21 +1311,6 @@ if [[ "$IS_SERVER" == true ]] || [[ -n "${SSH_CONNECTION:-}" ]] || [[ "$CURRENT_
             else
                 run_or_exec "$APP" "${APP_ARGS[@]}"
             fi
-            ;;
-
-        zed|zeditor)
-            zed_bin=""
-            for candidate in "$APP" zeditor zed; do
-                if zed_bin="$(resolve_remote_command "$candidate")"; then
-                    break
-                fi
-                zed_bin=""
-            done
-            if [[ -z "$zed_bin" ]]; then
-                echo "remote-app-pipe: none of '${APP}', 'zeditor', or 'zed' was found on ${CURRENT_HOST}." >&2
-                exit 127
-            fi
-            run_or_exec "$zed_bin" "${APP_ARGS[@]}"
             ;;
 
         *)
